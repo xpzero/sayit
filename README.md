@@ -4,8 +4,11 @@
 
 > 灵感来源：**[Typeless](https://typeless.com)** 与 **[TypeAloud](https://typealoud.app)**（开源）。
 > 前者定义了"快捷键听写 → 文字注入光标处"的交互范式（含 Fn 键触发、按应用注入规则）；
-> 后者开创了 Qwen3-ASR + llama.cpp 的端上听写路线并验证了其在 Mac 上的可行性。
+> 后者验证了 Qwen3-ASR + llama.cpp 端上听写在 Mac 上的可行性。
 > Sayit 站在两者的肩膀上，做一个**完全开源、免费、可插拔**的版本。感谢两款优秀的先行者。
+>
+> 商标声明：Typeless、TypeAloud 等名称与商标归其各自所有者所有。Sayit 为独立项目，
+> 与上述项目无隶属、合作或代言关系，文中提及仅为事实性说明与致谢。
 
 ## 功能
 
