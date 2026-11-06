@@ -29,12 +29,13 @@
       {
         "label": "settings",
         "title": "Sayit 设置",
-        "width": 540,
-        "height": 760,
-        "minWidth": 480,
-        "minHeight": 600,
+        "width": 680,
+        "height": 820,
+        "minWidth": 560,
+        "minHeight": 640,
         "visible": false,
-        "resizable": true
+        "resizable": true,
+        "theme": "Dark"
       }
     ],
     "security": {

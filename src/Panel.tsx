@@ -16,6 +16,12 @@ type PanelState =
       reason?: string | null;
     };
 
+// 声波包络：24 根条纹各自的放大系数（中间高、两侧低的伪随机节奏）
+const WAVE_SHAPE = [
+  0.4, 0.7, 0.5, 0.9, 0.6, 1, 0.7, 0.85, 0.5, 0.95, 0.65, 1, 0.8, 0.55, 0.9, 0.7, 1, 0.6,
+  0.85, 0.5, 0.75, 0.45, 0.65, 0.4,
+];
+
 export default function Panel() {
   const [state, setState] = useState<PanelState>({ kind: "idle" });
   const [level, setLevel] = useState(0);
@@ -49,6 +55,13 @@ export default function Panel() {
         injected?: boolean;
         reason?: string | null;
       }>("result", (e) => {
+        // 注入成功：文字已落进用户光标处，面板不再打扰，即刻收起
+        if (!e.payload.error && e.payload.injected === true) {
+          setState({ kind: "idle" });
+          invoke("hide_panel").catch(() => {});
+          return;
+        }
+        // 失败/未注入/报错：面板保留（复制按钮兜底），到点自动收起
         setState({
           kind: "result",
           text: e.payload.text,
@@ -91,11 +104,13 @@ export default function Panel() {
               {silent ? "未听到声音 · 检查麦克风" : state.model}
             </span>
           </div>
-          <div className="level-track">
-            <div
-              className="level-fill"
-              style={{ width: `${Math.min(100, level * 160)}%` }}
-            />
+          <div className="wave" aria-hidden="true">
+            {WAVE_SHAPE.map((f, i) => (
+              <i
+                key={i}
+                style={{ transform: `scaleY(${Math.max(0.06, Math.min(1, level * 1.6 * f))})` }}
+              />
+            ))}
           </div>
         </div>
       )}
@@ -103,7 +118,13 @@ export default function Panel() {
       {state.kind === "transcribing" && (
         <div className="capsule">
           <div className="capsule-main">
-            <span className="spinner" />
+            <span className="wave eq" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+              <i />
+              <i />
+            </span>
             <span className="hint">{state.note ?? "识别中…"}</span>
           </div>
         </div>
