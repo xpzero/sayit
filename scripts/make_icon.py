@@ -1,64 +1,60 @@
-# Sayit 图标生成器：录音点词标 —— 墨蓝平涂底 + 暖白圆润字 "Sayit"
-# 象形手法：i 的点 = 录音红点（珊瑚橙圆点 + 微辉光）——这个字正在被"说出来"
-# 字体：Arial Rounded Bold（圆头圆润，和圆点同一语言）；i 用无点 ı（U+0131）占位
+# Sayit 图标生成器 · E 定稿「墨滴字」
+# 米纸底 + 角落淡墨晕 + 手写 sa（Bradley Hand Bold）+ 朱砂一点
+# 与宣纸文人风 UI 同一血统（米纸 / 墨 / 朱砂）
 # 用法：uv run --with pillow scripts/make_icon.py
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 S = 1024
-INK_BG = (31, 40, 54)        # 墨蓝平涂 #1F2836
-TEXT_C = (242, 237, 228)     # 暖白 #F2EDE4
-DOT_C = (255, 90, 60)        # 录音点 #FF5A3C
+PAPER = (253, 246, 236)     # 宣纸 #FDF6EC
+SUMI = (23, 26, 32)         # 墨 #171A20
+SEAL = (198, 70, 47)        # 朱砂 #C6462F
 
-FONT = "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf"
+FONT_CANDIDATES = [
+    "/System/Library/Fonts/Supplemental/Bradley Hand Bold.ttf",
+    "/System/Library/Fonts/Supplemental/ChalkboardSE.ttc",
+]
 
-img = Image.new("RGBA", (S, S), INK_BG + (255,))
-mask = Image.new("L", (S, S), 0)
-ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=232, fill=255)
-img.putalpha(mask)
+paper = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+pd = ImageDraw.Draw(paper)
+pd.rounded_rectangle([0, 0, S - 1, S - 1], radius=246, fill=PAPER + (255,))
 
-# ---- 词标宽度自适应（无点 ı，让位给录音点） ----
-TEXT = "Sayıt"
-measure = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
-size = 300
-for _ in range(4):
-    font = ImageFont.truetype(FONT, size)
-    w = measure.textlength(TEXT, font=font)
-    if abs(w - 800) < 6:
+# 角落淡墨晕（左下重、右上轻）——纸被墨养过的呼吸感
+wash = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+wd = ImageDraw.Draw(wash)
+wd.ellipse([-260, 700, 320, 1280], fill=SUMI + (30,))
+wd.ellipse([740, -240, 1300, 320], fill=SUMI + (22,))
+wash = wash.filter(ImageFilter.GaussianBlur(90))
+paper = Image.alpha_composite(paper, wash)
+
+# 手写 "sa"
+font = None
+for path in FONT_CANDIDATES:
+    try:
+        font = ImageFont.truetype(path, 640)
+        print(f"字体：{path}")
         break
-    size = max(1, round(size * 800 / w))
+    except Exception:
+        continue
+assert font is not None, "没有可用的手写字体"
 
-x0, base = (S - w) / 2, 620
-w_say = measure.textlength("Say", font=font)
-w_i = measure.textlength("ı", font=font)
+d = ImageDraw.Draw(paper)
+bbox = d.textbbox((0, 0), "sa", font=font)
+tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+tx = (S - tw) / 2 - bbox[0] - 42       # 略左，给朱砂点让位
+ty = (S - th) / 2 - bbox[1] - 34       # 略上
+d.text((tx, ty), "sa", font=font, fill=SUMI + (255,))
 
-# 先画整词（阴影 + 暖白主体）
-word = Image.new("L", (S, S), 0)
-ImageDraw.Draw(word).text((x0, base), TEXT, font=font, fill=255, anchor="ls")
+# 朱砂一点（字的右下方——i 上的那滴，话音刚落）
+r = 36
+cx = int(tx + bbox[0] + tw + 92)
+cy = int(ty + bbox[1] + th - 48)
+d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=SEAL + (255,))
 
-shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-sa = ImageChops.offset(word, 0, 10).point(lambda a: int(a * 0.4))
-shadow.paste((8, 12, 20, 255), (0, 0), sa)
-shadow = shadow.filter(ImageFilter.GaussianBlur(8))
-img.alpha_composite(shadow)
-img.paste(TEXT_C + (255,), (0, 0), word)
-
-# ---- 象形点：录音红点替换 ı 的点，带同色微辉光 ----
-stem_cx = x0 + w_say + w_i / 2
-ascent, _ = font.getmetrics()
-bb = measure.textbbox((0, 0), "ı", font=font)  # bbox y 相对顶线（ascender）
-stem_top = base - (ascent - bb[1])  # 换算到画布坐标：字干顶端
-r = size * 0.085
-cy = stem_top - r * 1.35
-
-glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-ImageDraw.Draw(glow).ellipse(
-    [stem_cx - r * 2.1, cy - r * 2.1, stem_cx + r * 2.1, cy + r * 2.1],
-    fill=DOT_C + (120,),
-)
-img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(14)))
-
-d = ImageDraw.Draw(img)
-d.ellipse([stem_cx - r, cy - r, stem_cx + r, cy + r], fill=DOT_C + (255,))
+# 圆角蒙版裁切（墨晕不许出纸边）
+img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+mask = Image.new("L", (S, S), 0)
+ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=246, fill=255)
+img.paste(paper, (0, 0), mask)
 
 img.save("scripts/icon-source.png")
-print(f"已生成 scripts/icon-source.png（字号 {size}，点径 {2 * r:.0f}px）")
+print("已生成 scripts/icon-source.png（E 墨滴字 · 米纸/墨/朱砂）")

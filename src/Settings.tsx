@@ -18,21 +18,22 @@ type Tab = "rec" | "model" | "key" | "cloud" | "perm" | "about";
 // 字节数 -> MB 文本
 const fmtMB = (b?: number) => (b ? `${(b / 1024 / 1024).toFixed(0)} MB` : "0 MB");
 
-// 品牌标识：与应用图标同款 —— 墨蓝平涂底 + 暖白圆润字，i 的点是录音红点（象形：正在说出）
+// 品牌标识：与应用图标同款 E「墨滴字」—— 米纸底 + 手写墨字 + 朱砂一点
 const Logo = ({ size = 32 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 64 64" aria-hidden="true">
-    <rect x="2" y="2" width="60" height="60" rx="15" fill="#1F2836" />
-    <g fill="#F2EDE4" fontFamily="'Arial Rounded MT Bold', 'PingFang SC', sans-serif">
-      <text x="10.5" y="40" fontSize="15">
-        Say
-      </text>
-      <rect x="39.5" y="31" width="3.6" height="9" rx="1.8" />
-      <text x="46.5" y="40" fontSize="15">
-        t
-      </text>
-    </g>
-    <circle cx="41.3" cy="26.5" r="5.5" fill="#FF5A3C" opacity="0.3" />
-    <circle cx="41.3" cy="26.5" r="2.9" fill="#FF5A3C" />
+    <rect x="2" y="2" width="60" height="60" rx="14" fill="#FDF6EC" stroke="#E8DDC6" strokeWidth="2" />
+    <text
+      x="27"
+      y="44"
+      textAnchor="middle"
+      fontFamily="'Bradley Hand', 'Chalkboard SE', cursive"
+      fontWeight="700"
+      fontSize="28"
+      fill="#171A20"
+    >
+      sa
+    </text>
+    <circle cx="45" cy="42" r="4.2" fill="#C6462F" />
   </svg>
 );
 

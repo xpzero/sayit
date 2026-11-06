@@ -2,6 +2,10 @@
 
 按快捷键说话，文字自动出现在光标处。免费、离线优先、语音不出本机。
 
+## 界面预览
+
+![Sayit 设置](docs/ui-settings.png)
+
 > 灵感来源：**[Typeless](https://typeless.com)** 与 **[TypeAloud](https://typealoud.app)**（开源）。
 > 前者定义了"快捷键听写 → 文字注入光标处"的交互范式（含 Fn 键触发、按应用注入规则）；
 > 后者验证了 Qwen3-ASR + llama.cpp 端上听写在 Mac 上的可行性。
