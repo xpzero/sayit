@@ -220,6 +220,12 @@ pub fn open_mic_settings(app: AppHandle) -> Result<(), String> {
 
 // ---------- 注入兜底（步骤 7） ----------
 
+// 辅助功能授权状态（设置页权限体检用）
+#[tauri::command]
+pub fn accessibility_status() -> bool {
+    crate::inject::accessibility_ok()
+}
+
 // 面板"复制"按钮：只写剪贴板
 #[tauri::command]
 pub fn copy_text(text: String) -> Result<(), String> {

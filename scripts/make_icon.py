@@ -1,49 +1,64 @@
-# Sayit 图标生成器：渐变圆角方底 + 白色麦克风
-# "说出来" = 听写本体，双色 #4F7CFF → #2DD4BF（蓝→青碧，无紫色）与 UI 品牌一致
+# Sayit 图标生成器：录音点词标 —— 墨蓝平涂底 + 暖白圆润字 "Sayit"
+# 象形手法：i 的点 = 录音红点（珊瑚橙圆点 + 微辉光）——这个字正在被"说出来"
+# 字体：Arial Rounded Bold（圆头圆润，和圆点同一语言）；i 用无点 ı（U+0131）占位
 # 用法：uv run --with pillow scripts/make_icon.py
-import math
-
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 S = 1024
-TOP = (79, 124, 255)     # 天空蓝 #4F7CFF
-BOTTOM = (45, 212, 191)  # 青碧 #2DD4BF
+INK_BG = (31, 40, 54)        # 墨蓝平涂 #1F2836
+TEXT_C = (242, 237, 228)     # 暖白 #F2EDE4
+DOT_C = (255, 90, 60)        # 录音点 #FF5A3C
 
-img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+FONT = "/System/Library/Fonts/Supplemental/Arial Rounded Bold.ttf"
 
-# 垂直渐变背景，圆角矩形蒙版
-grad = Image.new("RGBA", (S, S))
-gd = ImageDraw.Draw(grad)
-for y in range(S):
-    t = y / S
-    color = tuple(int(TOP[i] + (BOTTOM[i] - TOP[i]) * t) for i in range(3)) + (255,)
-    gd.line([(0, y), (S, y)], fill=color)
+img = Image.new("RGBA", (S, S), INK_BG + (255,))
 mask = Image.new("L", (S, S), 0)
 ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=232, fill=255)
-img.paste(grad, (0, 0), mask)
+img.putalpha(mask)
 
-# 麦克风画在独立图层，画完按内容 bbox 重新居中（几何微调不破坏构图）
-layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-d = ImageDraw.Draw(layer)
-WHITE = (255, 255, 255, 255)
+# ---- 词标宽度自适应（无点 ı，让位给录音点） ----
+TEXT = "Sayıt"
+measure = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
+size = 300
+for _ in range(4):
+    font = ImageFont.truetype(FONT, size)
+    w = measure.textlength(TEXT, font=font)
+    if abs(w - 800) < 6:
+        break
+    size = max(1, round(size * 800 / w))
 
-# 胶囊主体
-d.rounded_rectangle([392, 210, 632, 630], radius=120, fill=WHITE)
+x0, base = (S - w) / 2, 620
+w_say = measure.textlength("Say", font=font)
+w_i = measure.textlength("ı", font=font)
 
-# U 形托架弧（圆头端点用小圆补齐）
-cx, cy, r, w = 512, 420, 290, 56
-d.arc([cx - r, cy - r, cx + r, cy + r], 30, 150, fill=WHITE, width=w)
-for a in (30, 150):
-    ex = cx + r * math.cos(math.radians(a))
-    ey = cy + r * math.sin(math.radians(a))
-    d.ellipse([ex - w / 2, ey - w / 2, ex + w / 2, ey + w / 2], fill=WHITE)
+# 先画整词（阴影 + 暖白主体）
+word = Image.new("L", (S, S), 0)
+ImageDraw.Draw(word).text((x0, base), TEXT, font=font, fill=255, anchor="ls")
 
-# 立杆 + 底座
-d.rounded_rectangle([484, 710, 540, 780], radius=28, fill=WHITE)
-d.rounded_rectangle([382, 800, 642, 856], radius=28, fill=WHITE)
+shadow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+sa = ImageChops.offset(word, 0, 10).point(lambda a: int(a * 0.4))
+shadow.paste((8, 12, 20, 255), (0, 0), sa)
+shadow = shadow.filter(ImageFilter.GaussianBlur(8))
+img.alpha_composite(shadow)
+img.paste(TEXT_C + (255,), (0, 0), word)
 
-mark = layer.crop(layer.getbbox())
-img.paste(mark, ((S - mark.width) // 2, (S - mark.height) // 2), mark)
+# ---- 象形点：录音红点替换 ı 的点，带同色微辉光 ----
+stem_cx = x0 + w_say + w_i / 2
+ascent, _ = font.getmetrics()
+bb = measure.textbbox((0, 0), "ı", font=font)  # bbox y 相对顶线（ascender）
+stem_top = base - (ascent - bb[1])  # 换算到画布坐标：字干顶端
+r = size * 0.085
+cy = stem_top - r * 1.35
+
+glow = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+ImageDraw.Draw(glow).ellipse(
+    [stem_cx - r * 2.1, cy - r * 2.1, stem_cx + r * 2.1, cy + r * 2.1],
+    fill=DOT_C + (120,),
+)
+img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(14)))
+
+d = ImageDraw.Draw(img)
+d.ellipse([stem_cx - r, cy - r, stem_cx + r, cy + r], fill=DOT_C + (255,))
 
 img.save("scripts/icon-source.png")
-print("已生成 scripts/icon-source.png")
+print(f"已生成 scripts/icon-source.png（字号 {size}，点径 {2 * r:.0f}px）")

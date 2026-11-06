@@ -93,7 +93,8 @@ pub fn run() {
             commands::stop_hotkey_capture,
             commands::open_keyboard_settings,
             commands::copy_text,
-            commands::open_accessibility_settings
+            commands::open_accessibility_settings,
+            commands::accessibility_status
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
