@@ -50,12 +50,20 @@ pub fn run() {
             // 启动即读一次配置——首次运行会自动落一份默认 config.json
             let _ = config::load(app.handle());
 
-            // 注册全局快捷键（默认 Option+Space；冲突只记日志，不让应用起不来）
+            // 收割上次运行（dev 硬重启/崩溃）留下的孤儿 llama-server
+            stt::local::reap_orphan_engines(app.handle());
+
+            // 引擎预热：启动即后台装载模型，第一次听写就是热的
+            stt::local::warmup(app.handle());
+
+            // 编译快捷键匹配集并发布给事件 tap（单键失败汇总日志，不让应用起不来）
             if let Err(e) = hotkey::register_all(app.handle()) {
                 eprintln!("[hotkey] {e}");
             }
 
-            // 输入监视线程：平时盯 Fn，录制框激活时进入捕获模式
+            // 按键事件统一入口（CGEventTap：组合触发/Fn/捕获/Esc 中止）
+            hotkey::tap::spawn(app.handle().clone());
+            // Menu 键(110) 状态轮询兜底（实测它不派发 keyDown 事件，tap 看不见）
             hotkey::fn_listener::spawn_monitor(app.handle().clone());
 
             // 菜单栏托盘
@@ -81,6 +89,7 @@ pub fn run() {
             commands::detect_engine,
             commands::toggle_recording,
             commands::hide_panel,
+            commands::resize_panel,
             commands::mic_selftest,
             commands::open_mic_settings,
             commands::get_model_library,
@@ -93,6 +102,7 @@ pub fn run() {
             commands::stop_hotkey_capture,
             commands::open_keyboard_settings,
             commands::copy_text,
+            commands::open_settings,
             commands::open_accessibility_settings,
             commands::accessibility_status
         ])

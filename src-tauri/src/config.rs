@@ -93,7 +93,8 @@ impl Default for SttConfig {
     fn default() -> Self {
         Self {
             provider: "local".into(),
-            local_model_id: Some("qwen3-asr-0.6b".into()),
+            // 不预选模型：新用户在模型库自己挑（竞品同理——首启引导下载，不静默给默认值）
+            local_model_id: None,
             cloud: CloudStt::default(),
         }
     }

@@ -112,16 +112,27 @@ export default function Settings() {
   const [tab, setTab] = useState<Tab>("rec");
   const [config, setConfig] = useState<Config | null>(null);
   const [engine, setEngine] = useState<EngineStatus | null>(null);
-  const [saved, setSaved] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [selftest, setSelftest] = useState<Selftest>({ kind: "idle" });
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [dl, setDl] = useState<Record<string, DownloadEvent>>({});
   const [libErr, setLibErr] = useState<string | null>(null);
-  const [capturing, setCapturing] = useState(false);
+  const [capturing, setCapturing] = useState(false); // 快捷键输入框聚焦 = 录制态
+  const [preview, setPreview] = useState<string | null>(null); // keydown 实时预览的组合
   const [axOk, setAxOk] = useState<boolean | null>(null);
   const cfgRef = useRef<Config | null>(null);
   cfgRef.current = config; // 事件回调里读最新配置用
+  const hkInputRef = useRef<HTMLInputElement>(null);
+  // 事件监听（挂载时注册一次）→ 组件内最新函数的桥
+  const addHotkeyRef = useRef<((k: string) => void) | null>(null);
+  const removeHotkeyRef = useRef<((k: string) => void) | null>(null);
+
+  // 所有设置改动都走这里：改内存即落盘（后端增量同步快捷键，无变化时空跑）
+  const update = (next: Config) => {
+    setConfig(next);
+    setSaveErr(null); // 成功路径清旧错；失败会在 catch 里重新亮起
+    invoke("save_config", { config: next }).catch((e) => setSaveErr(String(e)));
+  };
 
   const refreshLibrary = () =>
     invoke<LibraryItem[]>("get_model_library")
@@ -162,19 +173,26 @@ export default function Settings() {
         }
       }
     });
-    // 快捷键捕获频道：录到的组合直接入库并即时生效
+    // 后端 tap 的捕获事件：keyup 提交组合 / Fn 与 Menu 令牌；cancelled = Esc 退出
     const un3b = listen<{ key?: string; cancelled?: boolean }>("hotkey-captured", (e) => {
-      setCapturing(false);
-      const p = e.payload;
-      if (p.cancelled || !p.key || p.key === "Space") return;
+      if (e.payload.cancelled) return;
+      const key = e.payload.key;
+      if (key) addHotkeyRef.current?.(key);
+    });
+    // keyDown 实时预览（修饰符 + 主键的组合名由后端拼好）
+    const un3c = listen<{ key?: string }>("hotkey-preview", (e) => {
+      if (e.payload.key) setPreview(e.payload.key);
+    });
+    // ⌫ 删末尾（后端 tap 在捕获态转发）
+    const un3d = listen("hotkey-remove-last", () => {
       const cur = cfgRef.current;
-      if (!cur || cur.hotkeys.dictation.includes(p.key)) return;
-      const next: Config = {
-        ...cur,
-        hotkeys: { ...cur.hotkeys, dictation: [...cur.hotkeys.dictation, p.key] },
-      };
-      setConfig(next);
-      invoke("save_config", { config: next }).catch((err) => setSaveErr(String(err)));
+      if (cur && cur.hotkeys.dictation.length > 0)
+        removeHotkeyRef.current?.(cur.hotkeys.dictation[cur.hotkeys.dictation.length - 1]);
+    });
+    // 深链直达某个 tab（如"未配置模型"面板按钮 → 模型库）
+    const un4 = listen<{ tab?: string }>("goto-tab", (e) => {
+      const t = e.payload.tab as Tab | undefined;
+      if (t) setTab(t);
     });
     // 窗口隐藏不销毁（✕=隐藏），所以每次重新聚焦时自动拉新数据，避免旧快照
     const un3 = getCurrentWindow().onFocusChanged(({ payload: focus }) => {
@@ -183,6 +201,11 @@ export default function Settings() {
         invoke<Config>("get_config").then(setConfig);
         invoke<EngineStatus>("detect_engine").then(setEngine);
         invoke<boolean>("accessibility_status").then(setAxOk);
+      } else {
+        // 窗口失焦必停捕获：否则焦点去了别的应用还在打字，每个裸键都会被录进配置
+        setCapturing(false);
+        setPreview(null);
+        invoke("stop_hotkey_capture").catch(() => {});
       }
     });
     // 兜底轮询：窗口一直开着不动焦点时，数据也会每 2 秒自动保鲜
@@ -192,6 +215,9 @@ export default function Settings() {
       un2.then((f) => f());
       un3.then((f) => f());
       un3b.then((f) => f());
+      un3c.then((f) => f());
+      un3d.then((f) => f());
+      un4.then((f) => f());
       clearInterval(timer);
     };
   }, []);
@@ -199,21 +225,43 @@ export default function Settings() {
   if (!config) return <div className="loading">加载中…</div>;
 
   const setProvider = (p: Config["stt"]["provider"]) =>
-    setConfig({ ...config, stt: { ...config.stt, provider: p } });
+    update({ ...config, stt: { ...config.stt, provider: p } });
 
   const setCloud = (patch: Partial<Config["stt"]["cloud"]>) =>
-    setConfig({ ...config, stt: { ...config.stt, cloud: { ...config.stt.cloud, ...patch } } });
+    update({ ...config, stt: { ...config.stt, cloud: { ...config.stt.cloud, ...patch } } });
 
-  const save = async () => {
-    setSaveErr(null);
-    try {
-      await invoke("save_config", { config });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1500);
-      setEngine(await invoke<EngineStatus>("detect_engine"));
-    } catch (e) {
-      setSaveErr(String(e));
+  // ---------- 快捷键输入框 ----------
+  // 捕获逻辑全在后端（CGEventTap：keydown 预览 / keyup 提交 / Fn、Menu 轮询兜底），
+  // 前端只负责焦点开关、Esc 退出和事件展示。
+
+  const addHotkey = (combo: string) => {
+    if (combo === "Space") {
+      setPreview("Space 需要加修饰键"); // 与后端方言同规则
+      setTimeout(() => setPreview(null), 1500);
+      return;
     }
+    if (config.hotkeys.dictation.some((k) => k.toLowerCase() === combo.toLowerCase())) return;
+    update({
+      ...config,
+      hotkeys: { ...config.hotkeys, dictation: [...config.hotkeys.dictation, combo] },
+    });
+  };
+
+  const removeHotkey = (key: string) =>
+    update({
+      ...config,
+      hotkeys: {
+        ...config.hotkeys,
+        dictation: config.hotkeys.dictation.filter((x) => x !== key),
+      },
+    });
+  addHotkeyRef.current = addHotkey;
+  removeHotkeyRef.current = removeHotkey;
+
+  // 输入框只做两件事：吞掉一切默认行为 + Esc 退出录制（其余按键全由后端 tap 处理）
+  const onHkKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    e.preventDefault(); // IME、Tab 焦点转移都不会发生
+    if (e.code === "Escape") hkInputRef.current?.blur();
   };
 
   const defaultModel = library.find((m) => m.id === config.stt.localModelId);
@@ -234,9 +282,6 @@ export default function Settings() {
               {saveErr}
             </span>
           )}
-          <button className="primary" onClick={save}>
-            {saved ? "已保存 ✓" : "保存设置"}
-          </button>
         </div>
       </header>
 
@@ -333,7 +378,7 @@ export default function Settings() {
                       max={60}
                       value={config.panel.autoHideSeconds}
                       onChange={(e) =>
-                        setConfig({
+                        update({
                           ...config,
                           panel: {
                             ...config.panel,
@@ -355,7 +400,7 @@ export default function Settings() {
                       name="injection"
                       checked={config.injection.mode === "paste"}
                       onChange={() =>
-                        setConfig({ ...config, injection: { ...config.injection, mode: "paste" } })
+                        update({ ...config, injection: { ...config.injection, mode: "paste" } })
                       }
                     />
                     <div>
@@ -369,7 +414,7 @@ export default function Settings() {
                       name="injection"
                       checked={config.injection.mode === "type"}
                       onChange={() =>
-                        setConfig({ ...config, injection: { ...config.injection, mode: "type" } })
+                        update({ ...config, injection: { ...config.injection, mode: "type" } })
                       }
                     />
                     <div>
@@ -518,49 +563,48 @@ export default function Settings() {
               <h2 className="sect">快捷键</h2>
               <p className="desc">开始/结束录音共用一个键；一个功能可绑多个快捷键。</p>
               <div className="card">
-                <h3>
-                  {Ico.key} 录音开关
-                  <button
-                    className={capturing ? "btn red" : "btn"}
-                    onClick={() => {
-                      setCapturing(!capturing);
-                      invoke(capturing ? "stop_hotkey_capture" : "start_hotkey_capture").catch(
-                        () => {},
-                      );
-                    }}
-                  >
-                    {capturing ? "录制中…按 Esc 取消" : "＋ 录制新快捷键"}
-                  </button>
-                </h3>
-                <div className="chips">
+                <h3>{Ico.key} 录音开关</h3>
+                <div
+                  className={capturing ? "hk-capture on" : "hk-capture"}
+                  onClick={() => hkInputRef.current?.focus()}
+                  onContextMenu={(e) => {
+                    // 录制态吞掉右键菜单弹出（Menu 键的录入由后端键码轮询负责，不走 DOM 事件）
+                    if (capturing) e.preventDefault();
+                  }}
+                >
                   {config.hotkeys.dictation.map((k) => (
                     <span key={k} className="chip">
                       {k === "Fn" ? "🌐 Fn" : k}
-                      <button
-                        className="x"
-                        onClick={() => {
-                          const next: Config = {
-                            ...config,
-                            hotkeys: {
-                              ...config.hotkeys,
-                              dictation: config.hotkeys.dictation.filter((x) => x !== k),
-                            },
-                          };
-                          setConfig(next);
-                          invoke("save_config", { config: next }).catch((e) =>
-                            setSaveErr(String(e)),
-                          );
-                        }}
-                      >
+                      <button className="x" onClick={() => removeHotkey(k)}>
                         ×
                       </button>
                     </span>
                   ))}
+                  <input
+                    ref={hkInputRef}
+                    className="hk-input"
+                    readOnly
+                    value={preview ?? ""}
+                    placeholder={
+                      capturing ? "按下组合、抬起即录入 · Esc 退出 · ⌫ 删末尾" : "点击此处录制快捷键"
+                    }
+                    onFocus={() => {
+                      setCapturing(true);
+                      invoke("start_hotkey_capture").catch(() => {});
+                    }}
+                    onBlur={() => {
+                      setCapturing(false);
+                      setPreview(null);
+                      invoke("stop_hotkey_capture").catch(() => {});
+                    }}
+                    onKeyDown={onHkKeyDown}
+                  />
                 </div>
-                <div className="recbox">
-                  点击「录制」后直接按下组合键（⌘⌃⌥⇧ 修饰符、F1-F12、字母数字，含 🌐 Fn
-                  键——按住半秒即可）
-                </div>
+                <p className="muted small-top">
+                  修饰符（⌘⌃⌥⇧）+ 任意键：字母数字、F1-F20、Home / End / PgUp / PgDn、Ins /
+                  Del、小键盘、方向键、反引号；🌐 Fn 与 PC 键盘的 Menu
+                  键单独点按录入。系统保留组合（⌘Tab 等）无法捕获。
+                </p>
               </div>
               {config.hotkeys.dictation.some((k) => k === "Fn") && (
                 <div className="card">
@@ -587,7 +631,7 @@ export default function Settings() {
               <h2 className="sect">云端识别</h2>
               <p className="desc">
                 任何 OpenAI 兼容接口：OpenAI / 硅基流动 / Groq / 本地 faster-whisper 服务。
-                保存后生效。
+                修改即保存。
               </p>
               <div className="grid2">
                 <div className="card">

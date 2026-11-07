@@ -25,6 +25,26 @@ export default function Panel() {
   const autoHide = useRef(5); // 面板自动收起秒数（启动时从配置读）
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ampRef = useRef(0); // Rust 每 50ms 推来的 RMS，动画只读它
+  const rootRef = useRef<HTMLDivElement | null>(null);
+
+  // 窗口贴合内容：胶囊尺寸一变就把窗口缩放到同尺寸（Rust 侧保持底部居中锚定）。
+  // 空态（无胶囊）不上报——保持上一个内容尺寸，窗口不至于缩没。
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    let last = "";
+    const ro = new ResizeObserver(() => {
+      if (!el.querySelector(".pill")) return;
+      const w = Math.ceil(el.offsetWidth);
+      const h = Math.ceil(el.offsetHeight);
+      const key = `${w}x${h}`;
+      if (key === last) return;
+      last = key;
+      invoke("resize_panel", { w, h }).catch(() => {});
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     invoke<{ panel: { autoHideSeconds: number } }>("get_config").then((c) => {
@@ -38,6 +58,8 @@ export default function Panel() {
           setState({ kind: "recording" });
           setSilent(false);
           ampRef.current = 0;
+        } else {
+          setState({ kind: "idle" }); // Esc 中止等场景：复位，避免声纹冻结在屏幕上
         }
       }),
       listen<{ stage: string; note?: string }>("phase", (e) => {
@@ -70,7 +92,13 @@ export default function Panel() {
       listen<{ rms: number }>("level", (e) => {
         ampRef.current = e.payload.rms;
       }),
-      listen<{ active: boolean }>("silence", (e) => setSilent(e.payload.active)),
+      listen<{ active: boolean }>("silence", (e) => {
+        setSilent(e.payload.active);
+        // 死麦警告亮 3 秒自动消隐（后台 warned 闩锁保证一次录音只提醒一次）
+        if (e.payload.active) {
+          setTimeout(() => setSilent(false), 3000);
+        }
+      }),
     ];
     return () => unsubs.forEach((u) => u.then((f) => f()));
   }, []);
@@ -93,6 +121,7 @@ export default function Panel() {
     let raf = 0;
     let t = 0;
     let last = performance.now();
+    let peak = 0.01; // AGC 滚动峰值：麦克风电平差 50 倍（耳机 0.1 vs 笔记本 0.007），固定放大系数治不了
 
     const tick = (now: number) => {
       const dt = Math.min(0.06, (now - last) / 1000);
@@ -101,7 +130,9 @@ export default function Panel() {
       const W = cv.width;
       const H = cv.height;
       ctx.clearRect(0, 0, W, H);
-      const amp = clamp01(ampRef.current * 1.6);
+      // 峰值缓慢衰减（≈每秒 ×0.74），停话后增益自动回落；对滚动峰值归一化，多小的麦都撑满
+      peak = Math.max(peak * 0.995, ampRef.current, 0.005);
+      const amp = clamp01((ampRef.current / peak) * 0.85);
       const gap = 4;
       const bw = 7; // 2x 画布：屏上 3.5px 条宽
       const total = BARS * bw + (BARS - 1) * gap;
@@ -130,7 +161,7 @@ export default function Panel() {
   }, [waveActive]);
 
   return (
-    <div className="panel-root">
+    <div className="panel-root" ref={rootRef}>
       {waveActive && (
         <div className="pill">
           <canvas ref={canvasRef} className="wave" width={352} height={88} aria-label="录音声纹" />
@@ -145,14 +176,30 @@ export default function Panel() {
 
       {state.kind === "transcribing" && (
         <div className="pill">
-          <span className="pill-text">{state.note ?? "识别中…"}</span>
+          <span className="thinking" aria-label="识别中">
+            <i />
+            <i />
+            <i />
+          </span>
+          {/* 冷启动等罕见场景仍保留说明文字（平时只有动效） */}
+          {state.note && <span className="pill-text">{state.note}</span>}
         </div>
       )}
 
       {state.kind === "result" && (
         <div className="pill result">
           {state.error ? (
-            <div className="pill-error">{state.error}</div>
+            <>
+              <div className="pill-error">{state.error}</div>
+              {state.reason === "no_model" && (
+                <button
+                  className="pill-btn"
+                  onClick={() => invoke("open_settings", { tab: "model" }).catch(() => {})}
+                >
+                  去模型库下载 →
+                </button>
+              )}
+            </>
           ) : (
             <>
               <div className="pill-result-text">{state.text}</div>
