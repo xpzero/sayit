@@ -2,6 +2,7 @@
 mod audio;
 mod commands;
 mod config;
+mod dictation;
 mod engines;
 mod hotkey;
 mod inject;

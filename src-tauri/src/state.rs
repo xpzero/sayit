@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use crate::audio::RecordingHandle;
 
 pub struct AppState {
+    /// 听写生命周期状态机（唯一的相位真相；迁移只经 dictation::step）
+    pub flow: crate::dictation::State,
     /// 进行中的录音（None = 空闲）
     pub recording: Option<RecordingHandle>,
     /// 音量广播线程的运行开关
@@ -21,6 +23,7 @@ pub struct AppState {
 impl AppState {
     pub fn new() -> Self {
         Self {
+            flow: crate::dictation::State::new(),
             recording: None,
             broadcasting: Arc::new(AtomicBool::new(false)),
             level: None,

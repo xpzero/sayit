@@ -239,10 +239,10 @@ fn handle_key_down(app: &AppHandle, kc: u16, flags: u64) {
         return;
     }
 
-    // Esc 中止录音（进行中才动）。读无锁标志而非 SharedState——
+    // Esc 中止录音（进行中才动）。读无锁相位镜像而非 SharedState——
     // 回调等互斥锁超过 ~1s 会被系统禁用 tap，全部热键失灵
     if kc == K_ESCAPE {
-        if crate::commands::RECORDING.load(Ordering::Relaxed) {
+        if crate::commands::ACTIVE.load(Ordering::Relaxed) {
             dispatch_abort(app);
         }
         return;
