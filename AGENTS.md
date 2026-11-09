@@ -83,25 +83,48 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
 
 ## 本机实测事实（别重新踩坑）
 
-- **AX 探测死亡陷阱**：`AXIsProcessTrusted()` 返回 true 的同时，AXUIElement 查询全部返回 -25212
-  （kAXErrorAPIDisabled）——dev 二进制重编译后 TCC 陈旧授权与代码签名失配。曾让两轮"焦点检测"全灭，
-  且制造了"Electron 角色不可靠"的错误归因（真凶始终是它）。事件注入（enigo→CGEventPost）不受影响。
+- **AX 探测死亡陷阱（2026-11-09 数据闭环，两段真相）**：
+  ① 错误码勘误：早期把 -25212 记成 kAXErrorAPIDisabled 是配错——**-25211 才是 APIDisabled，
+  -25212 是 NoValue（"该属性没有值"）**（SDK 头文件核对）。
+  ② "-25212 全灭"的真凶 = **AX 盲 App**：Electron 系 App（实测 DeepSeek Harness/com.deepseek.dsh）
+  自身 AX 树缺失，对它查 systemwide `AXFocusedApplication` 直接返回 -25212——同一时刻对
+  wezterm 查询返回 0（通道健康）。当年"AX 全灭"极可能是在这类 App 上测出来的，与 TCC 无关。
+  dev 侧 TCC 授权的真实修复 = **固定签名身份**（`src-tauri/scripts/dev-runner.sh` + 钥匙串身份
+  「Sayit Dev」，DR 锚定证书根哈希，跨编译存活；2026-11-09 实测 tauri dev 自动重启后 AX 通道
+  `app=0` 稳定存活）。`focus.rs` 链式分类：focusedApplication 层任何错误（含 -25212）一律
+  Unknown 走黑名单，绝不冒充"非输入态"；AX 盲 App 上非输入态原理上不可知（这信息只有 AX 有），
+  唯一安全解 = 照常注入 + 剪贴板兜底。
 - EDIFIER Fit900NB（USB 声卡）：StartIO 成功后 **~0.5s 才送真信号**，期间回调缺席或送全零；
   偶发驱动级 StartIO 拒绝（错误码 'what'），亚秒内自愈，开麦失败自动重试一次即可覆盖。
 - 麦克风权限被拒：macOS **不报错**，送全零假数据；死麦判定 = 整段峰值 < 0.0001。
 - 触发链：Fn=flagsChanged(12)、Menu(110)=状态轮询兜底、组合键=keyDown(10)。事件编号见 `tap.rs` MASK 注释。
 - 本地识别耗时数秒到数十秒，结果会迟到：`CYCLE` 周期计数器守卫迟到注入，翻篇即丢弃。
-- 面板窗口透明、尺寸贴合内容：**窗口级动画必抖**（窗口服务与 DOM 重排不同步）；
-  动效只做 CSS 层（opacity/transform，不参与布局）。
+- 面板窗口透明、**尺寸永久固定（520×170）+ 听写期内容结构也固定**：动态贴合内容经三种实现
+  （窗口瞬移/步进动画/透明帧掩护瞬移）实测全部有肉眼抖动——根因是窗口服务 `set_size`/
+  `set_position` 异步非原子、WKWebView 陈旧帧拉伸与新视口异步应用，竞态砍不尽；连"固定窗口 +
+  内容切换"（无动画纯替换）用户实测仍有抖感（2026-11-09 四轮实测结论）。终局方案：听写期
+  （唤醒/录音/识别）DOM 结构一个字不变——声纹条与状态灯同屏共存，相位只是属性级差异
+  （canvas 内起伏、灯色/恒宽三字标签），`win.show()` 路径零窗口操作（摆位只在启动做一次）。
+  结果态是唯一一次内容替换（终端态，自动收起）。代价：透明死区吃鼠标点击；
+  超长文本 line-clamp 截断（全文在剪贴板）；冷启动提示（"正在启动本地引擎"）舍弃
+  ——固定布局无落点，用户拍板接受（冷启动罕见：仅换模型/首启后第一次听写）。
 - TCC 按二进制授权：`swift`/探针从 ZCode shell 跑无辅助功能权限，AX 类探针要借 sayit 自身或让用户配合。
 
 ## 当前设计立场（改动前先读）
 
 - **识别结果常驻剪贴板**（不备份/还原）：任何情况下文字不丢；代价是每次听写覆盖剪贴板。
 - **录音期间零打扰**：不说"没声音"式提示；死麦结论只在停止时刻给（`silent_mic` 结果位 + 直达设置按钮）。
-- **不做 AX 焦点探测**（dev 二进制重编译后 TCC 授权与签名失配，AX API 全灭而 `AXIsProcessTrusted()` 谎报
-  true——实测 -25212，见下；事件注入走另一套检查不受影响）。桌面回退改用 **NSWorkspace frontmostApplication ==
-  Finder** 判定（普通 AppKit 信息，无需任何权限）：前台为 Finder 时不注入、文本进剪贴板、结果胶囊亮复制按钮；
-  其余场景注入成功即收起面板（零打扰，用户拍板：复制按钮只允许出现在"没注入进去"的现场）。
-  边界：Finder 内搜索/重命名也会走回退（NSWorkspace 不知焦点是否文本框），手动 ⌘V 即可，文字不丢。
+- **输入焦点探测走分层链（focus.rs）**：① AX 权威（focusedApplication → focusedUIElement →
+  editableAncestor，通道级错误一律 Unknown 不冒充判定）→ ② 前台 App 黑名单（Finder/Dock/
+  SystemUIServer/Wallpaper，NSWorkspace 无需权限）→ ③ 通用终端判定（前台 App 进程树宿主
+  TTY = 键盘直达，任何终端模拟器天然满足，与名字无关；附带命中带集成终端的 IDE——注入
+  通常正是想要的）→ ④ Unknown。
+  **注入判据（用户拍板 2026-11-09）：只有确认 Input 才注入**（AX 判定或终端判定）；
+  NoInput 与 Unknown 一律不注入、文本进剪贴板、结果胶囊亮复制按钮
+  （reason=no_input_focus / focus_unknown 分开徽标）——AX 盲 App 里"真在输入框"与"非输入态"
+  不可区分，一视同仁走按钮，文字不丢。例外：辅助功能未授权时放行走注入路径（产出
+  NeedPermission + 自动带路开设置，否则用户只看到复制按钮、不知道要先授权）。
+  注入成功即收起面板（零打扰：复制按钮只出现在"没注入进去"的现场）。
+  取证仪器：设置→权限→「输入焦点体检」（判定 + AX 原始错误码 + 前台 App）。
+  AX 通道在 dev 的可用性依赖固定签名身份（见上「AX 探测死亡陷阱」勘误与 dev-runner.sh）。
 - **开麦流程**：先见面板（加载态）→ 后台开麦（失败自动重试一次）→ 真信号到达才亮声纹（2s 兜底）。

@@ -1,0 +1,5 @@
+# dev 签名稳定器：cargo run / cargo test 经由 runner 先以固定身份重签产物，
+# 让 TCC 辅助功能授权跨编译存活（方案与证书导入说明见 scripts/dev-runner.sh）。
+# 只覆盖 aarch64（本机 arm64）；x86_64/Rosetta 目标需另加 [target.x86_64-apple-darwin] 同款
+[target.aarch64-apple-darwin]
+runner = ["scripts/dev-runner.sh"]

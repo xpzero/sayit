@@ -2,11 +2,12 @@
 // 主方案 = 写剪贴板 + 模拟 Cmd+V（结果常驻剪贴板，不备份/还原——见 paste_text 内注释）
 // 备选   = 直接键入：合成携带 Unicode 文本的输入事件（剪贴板里也留一份兜底）
 //
-// 历史教训（2026-11-09 实测）：一切 AXUIElement 焦点探测在本应用不可用——dev 二进制
-// 重编译后 TCC 授权与代码签名失配，AXIsProcessTrusted() 谎报 true 而 AX API 全部返回
-// -25212（API disabled）；事件注入（enigo→CGEventPost）走另一套检查不受影响。
-// 桌面场景判定改用 NSWorkspace（frontmost_is_finder，无需任何权限）；注入成功即收起
-// 面板，复制按钮只出现在"没注入进去"的现场（失败/桌面回退，见 commands.rs deliver）。
+// 历史教训（2026-11-09 实测）：dev 二进制重编译后 TCC 授权与代码签名失配，
+// AXIsProcessTrusted() 谎报 true 而 AX 查询失败——事件注入（enigo→CGEventPost）走另一
+// 套检查不受影响。当年记录错误码为"-25212 (API disabled)"，SDK 头文件核对后勘误：
+// -25211 才是 APIDisabled，-25212 是 NoValue。焦点探测如今走 focus.rs 分层链——注入
+// 契约：只有确认 Input（含终端判定）才注入，NoInput/Unknown 不注入 + 复制按钮；
+// dev 签名固定方案见 scripts/dev-runner.sh。
 pub enum InjectOutcome {
     Injected,
     /// 辅助功能权限未开——模拟按键会被系统静默丢弃（不报错！），必须主动检测
@@ -30,37 +31,37 @@ pub fn accessibility_ok() -> bool {
     true
 }
 
-// 前台应用判定（桌面回退用）：NSWorkspace 是普通 AppKit 信息，**不需要辅助功能权限**，
-// 与 AX 死陷阱无关——AX 全灭后唯一可靠的"现在哪个 App 在最前面"通道。
-// 边界（明示的取舍）：它只知道前台是谁，不知道焦点是不是文本框（那个信息只有 AX 有）——
-// Finder 内搜索/重命名时也会判为桌面场景而走复制按钮；手动 ⌘V 即可，文字不丢。
+// 前台应用（bundle id + pid，focus.rs 名单兜底/终端判定与体检用）：NSWorkspace 是普通
+// AppKit 信息，**不需要辅助功能权限**——AX 通道之外唯一可靠的"现在哪个 App 在最前面"信号。
+// 边界（明示的取舍）：它只知道前台是谁，不知道焦点是不是文本框（那个信息只有 AX 有）。
 #[cfg(target_os = "macos")]
-pub fn frontmost_is_finder() -> bool {
+pub fn frontmost_app() -> Option<(String, i32)> {
     use objc2::{class, msg_send, runtime::AnyObject};
     unsafe {
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         if ws.is_null() {
-            return false;
+            return None;
         }
         let app: *mut AnyObject = msg_send![ws, frontmostApplication];
         if app.is_null() {
-            return false;
+            return None;
         }
         let bid: *mut AnyObject = msg_send![app, bundleIdentifier];
         if bid.is_null() {
-            return false;
+            return None;
         }
         let utf8: *const std::ffi::c_char = msg_send![bid, UTF8String];
         if utf8.is_null() {
-            return false;
+            return None;
         }
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy() == "com.apple.finder"
+        let pid: i32 = msg_send![app, processIdentifier];
+        Some((std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned(), pid))
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn frontmost_is_finder() -> bool {
-    false
+pub fn frontmost_app() -> Option<(String, i32)> {
+    None
 }
 
 pub fn paste_text(text: &str) -> InjectOutcome {
@@ -77,7 +78,8 @@ pub fn paste_text(text: &str) -> InjectOutcome {
     //    ⌘V 即可，任何情况下文字都不会丢；
     // 2) 备份/还原有先天竞态：还原太早，目标应用（网页/Electron 的慢事件循环）还没
     //    读剪贴板，用户粘到的反而是"旧内容"——实测踩坑；
-    // 3) AX 焦点探测区分"有没有输入框"这条路已被 -25212 证死（见文件头）。
+    // 3) 焦点探测判 NoInput/Unknown 时根本走不到这里（deliver 提前回退到复制按钮）；
+    //    能走到 = 确认输入态或未授权例外，注入落空的风险由剪贴板常驻兜底。
     // 代价：每次听写覆盖剪贴板。对听写工具而言"最后一次结果随手可粘"本就是合理语义。
     if let Err(e) = cb.set_text(text.to_string()) {
         return InjectOutcome::Failed(format!("写剪贴板失败：{e}"));

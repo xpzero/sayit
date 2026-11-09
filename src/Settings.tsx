@@ -13,6 +13,12 @@ type Selftest =
   | { kind: "done"; ok: boolean; verdict: string }
   | { kind: "error"; message: string };
 
+// 输入焦点体检：waiting = 3 秒让位窗口（让用户点进目标输入框），done 带 focus.rs 判定
+type FocusCheck =
+  | { kind: "idle" }
+  | { kind: "waiting" }
+  | { kind: "done"; verdict: string; basis: string; frontmost?: string | null; axTrusted?: boolean };
+
 type Tab = "rec" | "model" | "key" | "cloud" | "perm" | "about";
 
 // 字节数 -> MB 文本
@@ -114,6 +120,7 @@ export default function Settings() {
   const [engine, setEngine] = useState<EngineStatus | null>(null);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [selftest, setSelftest] = useState<Selftest>({ kind: "idle" });
+  const [focusCheck, setFocusCheck] = useState<FocusCheck>({ kind: "idle" });
   const [library, setLibrary] = useState<LibraryItem[]>([]);
   const [dl, setDl] = useState<Record<string, DownloadEvent>>({});
   const [libErr, setLibErr] = useState<string | null>(null);
@@ -194,6 +201,19 @@ export default function Settings() {
       const t = e.payload.tab as Tab | undefined;
       if (t) setTab(t);
     });
+    // 输入焦点体检（focus.rs 分层链的取证仪器）：waiting = 3 秒让位窗口，done 带判定与依据
+    const un5 = listen<{
+      stage?: string;
+      verdict?: string;
+      basis?: string;
+      frontmost?: string | null;
+      axTrusted?: boolean;
+    }>("focus-selftest", (e) => {
+      const p = e.payload;
+      if (p.stage === "waiting") setFocusCheck({ kind: "waiting" });
+      else if (p.verdict !== undefined && p.basis !== undefined)
+        setFocusCheck({ kind: "done", verdict: p.verdict, basis: p.basis, frontmost: p.frontmost, axTrusted: p.axTrusted });
+    });
     // 窗口隐藏不销毁（✕=隐藏），所以每次重新聚焦时自动拉新数据，避免旧快照
     const un3 = getCurrentWindow().onFocusChanged(({ payload: focus }) => {
       if (focus) {
@@ -218,6 +238,7 @@ export default function Settings() {
       un3c.then((f) => f());
       un3d.then((f) => f());
       un4.then((f) => f());
+      un5.then((f) => f());
       clearInterval(timer);
     };
   }, []);
@@ -738,6 +759,58 @@ export default function Settings() {
                     去授权
                   </button>
                 </div>
+
+                <div className="perm">
+                  <span
+                    className={
+                      focusCheck.kind === "done" && focusCheck.verdict === "Input"
+                        ? "st ok"
+                        : focusCheck.kind === "done"
+                          ? "st no"
+                          : "st no"
+                    }
+                  >
+                    {focusCheck.kind === "done"
+                      ? focusCheck.verdict === "Input"
+                        ? "✓"
+                        : "!"
+                      : "·"}
+                  </span>
+                  <div>
+                    <b>输入焦点</b>
+                    <small>
+                      {focusCheck.kind === "waiting"
+                        ? "3 秒内点进要探测的输入框（本窗口会让位）…"
+                        : focusCheck.kind === "done"
+                          ? `当前判定：${
+                              focusCheck.verdict === "Input"
+                                ? "在输入框（可自动注入）"
+                                : focusCheck.verdict === "NoInput"
+                                  ? "非输入态（将走复制按钮）"
+                                  : "判不出（默认注入，剪贴板兜底）"
+                            }`
+                          : "点右侧按钮探测输入焦点（诊断注入落位；有 3 秒时间点进目标输入框）"}
+                    </small>
+                  </div>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      setFocusCheck({ kind: "waiting" });
+                      invoke("focus_selftest").catch(() => setFocusCheck({ kind: "idle" }));
+                    }}
+                  >
+                    {focusCheck.kind === "waiting" ? "探测中…" : "体检"}
+                  </button>
+                </div>
+                {focusCheck.kind === "done" && (
+                  <p className={focusCheck.verdict === "Input" ? "ok-text" : "warn-text"}>
+                    {focusCheck.basis}
+                    {focusCheck.frontmost ? ` · 前台：${focusCheck.frontmost}` : ""}
+                    {focusCheck.axTrusted !== undefined
+                      ? ` · 辅助功能授权：${focusCheck.axTrusted ? "已授" : "未授"}`
+                      : ""}
+                  </p>
+                )}
 
                 <div className="perm">
                   <span

@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod dictation;
 mod engines;
+mod focus;
 mod hotkey;
 mod inject;
 mod models;
@@ -48,6 +49,9 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // 面板窗口启动时摆好位（几何恒定，此后 show/hide 不再碰位置）
+            commands::position_panel(app.handle());
+
             // 启动即读一次配置——首次运行会自动落一份默认 config.json
             let _ = config::load(app.handle());
 
@@ -90,9 +94,9 @@ pub fn run() {
             commands::detect_engine,
             commands::toggle_recording,
             commands::hide_panel,
-            commands::resize_panel,
             commands::mic_selftest,
             commands::open_mic_settings,
+            commands::focus_selftest,
             commands::get_model_library,
             commands::download_model,
             commands::cancel_download,

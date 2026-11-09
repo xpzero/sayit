@@ -1,7 +1,14 @@
 // 事件序列断言：面板状态机的全部迁移走查。与后端 dictation.rs 的迁移测试呼应——
 // 后端裁定"事件何时发"，这里裁定"事件到了面板进什么态"。
 import { describe, expect, it } from "vitest";
-import { injectedOk, nextState, type PanelEvent, type PanelState } from "./panelState";
+import {
+  badgeKeyOf,
+  injectedOk,
+  lampOf,
+  nextState,
+  type PanelEvent,
+  type PanelState,
+} from "./panelState";
 
 const idle: PanelState = { kind: "idle" };
 
@@ -144,5 +151,33 @@ describe("事件语义边界（忠实镜像现状）", () => {
   it("result(undefined) 未注入成功也进结果态（未自动插入 · 文本在剪贴板）", () => {
     const s = run([rec(true), phase(), result({ text: "t", injected: false, reason: null })]);
     expect(s.kind).toBe("result");
+  });
+});
+
+describe("相位视图与徽标映射（纯函数）", () => {
+  it("lampOf：听写三态进固定布局，idle/result 不在；灯档位一一对应", () => {
+    expect(lampOf("opening")).toEqual({ live: true, dot: "warm", label: "唤醒中" });
+    expect(lampOf("recording")).toEqual({ live: true, dot: "live", label: "录音中" });
+    expect(lampOf("transcribing")).toEqual({ live: true, dot: "busy", label: "识别中" });
+    expect(lampOf("idle")).toEqual({ live: false, dot: "", label: "" });
+    expect(lampOf("result")).toEqual({ live: false, dot: "", label: "" });
+    // 标签恒为三字（live-label 恒宽的前提）
+    for (const k of ["opening", "recording", "transcribing"] as const) {
+      expect([...lampOf(k).label]).toHaveLength(3);
+    }
+  });
+
+  it("badgeKeyOf：后端每个 reason 都有专属徽标，不落默认", () => {
+    expect(badgeKeyOf({ injected: true })).toBe("injected");
+    expect(badgeKeyOf({ injected: true, reason: "no_input_focus" })).toBe("injected"); // 注入成功优先
+    // 后端 deliver 产出的四个非错误 reason（commands.rs）逐一有专属键
+    expect(badgeKeyOf({ injected: false, reason: "accessibility" })).toBe("accessibility");
+    expect(badgeKeyOf({ injected: false, reason: "clipboard_failed" })).toBe("clipboard_failed");
+    expect(badgeKeyOf({ injected: false, reason: "no_input_focus" })).toBe("no_input_focus");
+    expect(badgeKeyOf({ injected: false, reason: "focus_unknown" })).toBe("focus_unknown");
+    // 未知/缺失 reason 才落默认徽标
+    expect(badgeKeyOf({ injected: false, reason: null })).toBe("miss");
+    expect(badgeKeyOf({ injected: false, reason: "whatever" })).toBe("miss");
+    expect(badgeKeyOf({})).toBe("miss");
   });
 });

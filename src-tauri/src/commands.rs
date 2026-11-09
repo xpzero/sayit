@@ -162,7 +162,7 @@ fn run_effects(
                 );
             }
             Effect::StopAndTranscribe { cycle } => stop_and_transcribe(app, cfg, cycle),
-            Effect::Deliver(outcome) => deliver(app, cfg, outcome),
+            Effect::Deliver { outcome, cycle } => deliver(app, cfg, outcome, cycle),
             Effect::DropLateResult => println!("[stt] 迟到的识别结果已丢弃（周期已翻篇）"),
             Effect::FailOpen(e) => {
                 eprintln!("[toggle] 开麦失败（已重试一次）：{e}");
@@ -317,53 +317,98 @@ fn stop_and_transcribe(app: &AppHandle, cfg: &config::Config, cycle: u64) {
     });
 }
 
-// 效果：交付结果。注入走主线程（enigo→HIToolbox 是 main-thread-only）；失败进结果位
-fn deliver(app: &AppHandle, cfg: &config::Config, outcome: crate::dictation::SttOutcome) {
+// 状态机当前的周期号（deliver 的迟到守卫用；锁不可用时回 0 = 必然抑制，宁可少显示）
+fn flow_cycle(app: &AppHandle) -> u64 {
+    use tauri::Manager;
+    let state = app.state::<crate::state::SharedState>();
+    state.lock().map(|s| s.flow.cycle).unwrap_or(0)
+}
+
+// 效果：交付结果。焦点探测放独立线程（AX 是同步 XPC，目标 App 卡死不能拖住交付），
+// 判定拿回后再回主线程注入（enigo→HIToolbox 是 main-thread-only）；失败进结果位。
+// 迟到守卫：cycle0 取自状态机接受 SttDone 的时刻（Effect::Deliver 携带，唯一正确采样
+// 点——deliver 入口再读会落进"锁释放→读"的缝隙）；stale 在主线程闭包内复读——热键
+// 处理与该闭包同走主线程队列、彼此串行，复读值闭包执行期间不会再变。迟到的面板信号
+// 会砸掉新现场（injected=true 直接收起录音中的面板），注入与剪贴板则照常（文字必交付）。
+fn deliver(
+    app: &AppHandle,
+    cfg: &config::Config,
+    outcome: crate::dictation::SttOutcome,
+    cycle0: u64,
+) {
     match outcome {
         crate::dictation::SttOutcome::Text(text) => {
             let mode = cfg.injection.mode.clone();
             let app3 = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                // 前台是 Finder（桌面场景）⌘V 只会打进虚空、注入还会谎报成功——
-                // 不注入，文本进剪贴板 + 结果胶囊亮复制按钮让用户自己落位。
-                // 判定走 NSWorkspace（无需权限，见 inject.rs），任何失败一律放行注入
-                if crate::inject::frontmost_is_finder() {
-                    // 剪贴板写失败要换徽标——不能一边失败一边承诺"文本在剪贴板"
-                    let cb_failed = crate::inject::copy_to_clipboard(&text).is_err();
-                    if cb_failed {
-                        eprintln!("[inject] 桌面回退写剪贴板失败");
-                    }
-                    let _ = app3.emit(
-                        "result",
-                        serde_json::json!({
-                            "text": text,
-                            "injected": false,
-                            "reason": if cb_failed { "clipboard_failed" } else { "no_input_focus" }
-                        }),
-                    );
-                    return;
+            std::thread::spawn(move || {
+                let report = crate::focus::probe(Duration::from_millis(300));
+                if report.verdict == crate::focus::Verdict::NoInput {
+                    println!("[focus] 非输入态，跳过注入（{}）", report.basis);
                 }
-                let outcome = if mode == "type" {
-                    crate::inject::type_text(&text)
-                } else {
-                    crate::inject::paste_text(&text)
-                };
-                let (injected, reason) = match outcome {
-                    crate::inject::InjectOutcome::Injected => (true, None),
-                    crate::inject::InjectOutcome::NeedPermission => {
-                        // 自动带路：系统不许可弹窗，但我们可以自动翻到正确的设置页
-                        // （每次运行只自动开一次；翻开关那一下永远必须用户亲手+密码）
-                        if !AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
-                            let _ = open_accessibility_page(&app3);
-                        }
-                        (false, Some("accessibility".to_string()))
+                let app4 = app3.clone();
+                let _ = app3.run_on_main_thread(move || {
+                    let stale = flow_cycle(&app4) != cycle0;
+                    if stale {
+                        println!("[focus] 交付迟到（周期已翻篇）：抑制面板事件，注入照常");
                     }
-                    crate::inject::InjectOutcome::Failed(e) => (false, Some(e)),
-                };
-                let _ = app3.emit(
-                    "result",
-                    serde_json::json!({ "text": text, "injected": injected, "reason": reason }),
-                );
+                    // 契约（用户拍板）：只有确认在输入框才注入。非输入态/判不出都不注入，
+                    // 文本进剪贴板 + 结果胶囊亮复制按钮让用户自己落位——AX 盲 App 里
+                    // "真在输入框"与"非输入态"不可区分，一视同仁走按钮，文字不丢。
+                    // 例外：辅助功能未授权时放行走注入路径——那里会产出 NeedPermission
+                    // 并自动带路开设置（否则用户永远只看到复制按钮，不知道要先授权）
+                    if report.verdict != crate::focus::Verdict::Input
+                        && crate::inject::accessibility_ok()
+                    {
+                        // 剪贴板写失败要换徽标——不能一边失败一边承诺"文本在剪贴板"
+                        let cb_failed = crate::inject::copy_to_clipboard(&text).is_err();
+                        if cb_failed {
+                            eprintln!("[inject] 非输入态回退写剪贴板失败");
+                        }
+                        let reason = if cb_failed {
+                            "clipboard_failed"
+                        } else if report.verdict == crate::focus::Verdict::NoInput {
+                            "no_input_focus"
+                        } else {
+                            "focus_unknown"
+                        };
+                        if !stale {
+                            let _ = app4.emit(
+                                "result",
+                                serde_json::json!({
+                                    "text": text,
+                                    "injected": false,
+                                    "reason": reason
+                                }),
+                            );
+                        }
+                        return;
+                    }
+                    // 确认输入态（或未授权走注入兜底）：照常注入
+                    let outcome = if mode == "type" {
+                        crate::inject::type_text(&text)
+                    } else {
+                        crate::inject::paste_text(&text)
+                    };
+                    let (injected, reason) = match outcome {
+                        crate::inject::InjectOutcome::Injected => (true, None),
+                        crate::inject::InjectOutcome::NeedPermission => {
+                            // 自动带路：系统不许可弹窗，但我们可以自动翻到正确的设置页
+                            // （每次运行只自动开一次；翻开关那一下永远必须用户亲手+密码。
+                            // 迟到交付不弹——别在新一轮录音中途抢焦点开设置页）
+                            if !stale && !AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
+                                let _ = open_accessibility_page(&app4);
+                            }
+                            (false, Some("accessibility".to_string()))
+                        }
+                        crate::inject::InjectOutcome::Failed(e) => (false, Some(e)),
+                    };
+                    if !stale {
+                        let _ = app4.emit(
+                            "result",
+                            serde_json::json!({ "text": text, "injected": injected, "reason": reason }),
+                        );
+                    }
+                });
             });
         }
         crate::dictation::SttOutcome::Failed { error, reason } => {
@@ -373,6 +418,31 @@ fn deliver(app: &AppHandle, cfg: &config::Config, outcome: crate::dictation::Stt
             );
         }
     }
+}
+
+// ---------- 输入焦点体检（取证仪器：判定 + AX 原始错误码 + 前台 App，见 focus.rs） ----------
+
+#[tauri::command]
+pub fn focus_selftest(app: AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // 设置窗本身可聚焦——立即探测只会测到 Sayit 自己的按钮（结构上不可能报 Input）。
+        // 先广播"等待"给用户 3 秒把焦点点进真正要测的现场，再探测
+        let _ = app.emit("focus-selftest", serde_json::json!({ "stage": "waiting" }));
+        std::thread::sleep(Duration::from_secs(3));
+        // 体检给足死线（交付路径只给 300ms，这里要的是准确不是快）
+        let report = crate::focus::probe(Duration::from_millis(1000));
+        let _ = app.emit(
+            "focus-selftest",
+            serde_json::json!({
+                "stage": "done",
+                "verdict": format!("{:?}", report.verdict),
+                "basis": report.basis,
+                "frontmost": crate::inject::frontmost_app().map(|(b, _)| b),
+                "axTrusted": crate::inject::accessibility_ok(),
+            }),
+        );
+    });
 }
 
 // 效果：丢弃在装流（录音中被 Esc）。随事件附带的"迟到流"不进这里——
@@ -396,7 +466,6 @@ fn discard_stream(app: &AppHandle, state: &State<'_, crate::state::SharedState>)
 
 #[tauri::command]
 pub fn hide_panel(app: AppHandle) {
-    SHOW_PENDING.store(false, Ordering::Relaxed); // 兜底显示线程不得复活已隐藏的面板
     if let Some(win) = app.get_webview_window("panel") {
         let _ = win.hide();
     }
@@ -632,7 +701,10 @@ pub fn set_default_model(app: AppHandle, id: String) -> Result<(), String> {
     config::save(&app, &cfg)
 }
 
-// 面板窗口贴合内容：胶囊多大、窗口就多大（唯一可见的"窗口"就是胶囊本身）
+// 面板窗口固定尺寸（520×170，见 tauri.conf.json）：一切状态切换都是胶囊在固定窗口内
+// 的 CSS 动效。动态贴合内容的三种实现（瞬移/步进动画/透明帧掩护瞬移）均实测有肉眼
+// 抖动——窗口服务 set_size/set_position 异步非原子 + WKWebView 陈旧帧拉伸/视口异步，
+// 竞态砍不尽；固定几何是唯一稳定解（详见 AGENTS.md「面板窗口」条）。
 const PANEL_BOTTOM_GAP: f64 = 96.0; // 距屏幕底部留白（避开 Dock 区域）
 
 // 主屏底部居中摆位（先摆位再显示，避免闪跳）
@@ -647,66 +719,26 @@ fn center_panel_bottom(win: &tauri::WebviewWindow, w: f64, h: f64) {
     }
 }
 
-// 出场防闪帧：show_panel 不再直接显示，而是等第一次尺寸贴合完成（内容已按新状态渲染、
-// 窗口已瞬移到正确尺寸）再 show——否则会先以旧尺寸（上次的结果胶囊）闪一帧再跳变。
-static SHOW_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn show_panel(app: &AppHandle) {
+/// 启动时摆一次面板位（窗口几何恒定，之后 show/hide 不再碰位置——show 路径零窗口操作）
+pub fn position_panel(app: &AppHandle) {
     let Some(win) = app.get_webview_window("panel") else {
         return;
     };
-    if !win.is_visible().unwrap_or(false) {
-        SHOW_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
-        // 兜底：内容迟迟不报尺寸（隐藏 webview 可能不排版）就按当前尺寸显示，绝不能永远藏着
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(250));
-            if SHOW_PENDING.swap(false, Ordering::Relaxed) {
-                if let Some(win) = app2.get_webview_window("panel") {
-                    if let Ok(size) = win.outer_size() {
-                        let sf = win
-                            .primary_monitor()
-                            .ok()
-                            .flatten()
-                            .map(|m| m.scale_factor())
-                            .unwrap_or(2.0);
-                        center_panel_bottom(&win, size.width as f64 / sf, size.height as f64 / sf);
-                    }
-                    let _ = win.show();
-                }
-            }
-        });
-    } else {
-        // 已可见（如结果展示中再按热键）：直接摆位即可，尺寸贴合走瞬移
-        if let Ok(size) = win.outer_size() {
-            let sf = win
-                .primary_monitor()
-                .ok()
-                .flatten()
-                .map(|m| m.scale_factor())
-                .unwrap_or(2.0);
-            center_panel_bottom(&win, size.width as f64 / sf, size.height as f64 / sf);
-        }
-        let _ = win.show();
+    if let Ok(size) = win.outer_size() {
+        let sf = win
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .map(|m| m.scale_factor())
+            .unwrap_or(2.0);
+        center_panel_bottom(&win, size.width as f64 / sf, size.height as f64 / sf);
     }
 }
 
-// 前端 ResizeObserver 报来内容尺寸（CSS 逻辑像素），窗口一步贴合到位。
-// 刻意不做步进动画：曾试过 6 步 easeOut 渐变（每步 18ms 各调一次 set_size + set_position），
-// 窗口服务与 DOM 重排各走各的节拍，步进途中窗口尺寸 ≠ 胶囊自然尺寸，flex 居中让
-// 胶囊在屏上每步挪一点 = 状态切换时的肉眼抖动。窗口本身透明无边框、边缘不可见，
-// 瞬移是唯一不抖的做法。
-#[tauri::command]
-pub fn resize_panel(app: AppHandle, w: f64, h: f64) {
-    let Some(win) = app.get_webview_window("panel") else {
-        return;
-    };
-    let w = w.max(40.0);
-    let h = h.max(40.0);
-    let _ = win.set_size(tauri::LogicalSize::new(w, h));
-    center_panel_bottom(&win, w, h);
-    // 出场流程的收尾：尺寸已就位，此刻显示就不会闪旧帧
-    if SHOW_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+fn show_panel(app: &AppHandle) {
+    // 摆位只在启动时做一次（position_panel）；此处纯显示——面板出现的路径上
+    // 没有任何 set_size/set_position，物理上不存在几何抖动源
+    if let Some(win) = app.get_webview_window("panel") {
         let _ = win.show();
     }
 }

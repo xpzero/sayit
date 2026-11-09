@@ -67,8 +67,10 @@ pub enum Effect {
     AnnounceRecording,
     /// 收流写 WAV，按整段峰值决定起识别还是直接静音结论
     StopAndTranscribe { cycle: u64 },
-    /// 交付识别结果（Text→注入+结果；Failed→结果位错误）
-    Deliver(SttOutcome),
+    /// 交付识别结果（Text→注入+结果；Failed→结果位错误）。
+    /// cycle = 状态机接受 SttDone 时的周期号（唯一正确采样点——壳据此识别"交付迟到"：
+    /// 交付完成时周期已翻篇 = 用户开了新一轮，面板事件须抑制而注入照常）
+    Deliver { outcome: SttOutcome, cycle: u64 },
     /// 周期已翻篇：迟到的识别结果丢弃（日志可查，不打扰用户）
     DropLateResult,
     /// 开麦失败：结果位报错
@@ -118,9 +120,10 @@ pub fn step(s: State, ev: &Event) -> (State, Vec<Effect>) {
         (Recording, Event::Signal | Event::ArmTimeout) => (s, vec![Ignored]),
 
         // —— 识别中（同周期的结果照常交付；Esc/杂音无意义）
-        (Transcribing, Event::SttDone { outcome, .. }) => {
-            (State { phase: Idle, ..s }, vec![Deliver(outcome.clone())])
-        }
+        (Transcribing, Event::SttDone { outcome, .. }) => (
+            State { phase: Idle, ..s },
+            vec![Deliver { outcome: outcome.clone(), cycle: s.cycle }],
+        ),
 
         // —— 其余组合（中止后开麦失败、识别中的 Esc/信号等）
         _ => (s, vec![Ignored]),
@@ -168,7 +171,7 @@ mod tests {
 
         let (s, e) = step(s, &Event::SttDone { cycle: 1, outcome: SttOutcome::Text("你好".into()) });
         assert_eq!(s.phase, Phase::Idle);
-        assert_eq!(e, vec![Effect::Deliver(SttOutcome::Text("你好".into()))]);
+        assert_eq!(e, vec![Effect::Deliver { outcome: SttOutcome::Text("你好".into()), cycle: 1 }]);
     }
 
     #[test]
@@ -264,7 +267,7 @@ mod tests {
         let (s, _) = step(s, &Event::MicReady); // Recording
         let (s, _) = step(s, &Event::TogglePressed); // 停止 → Transcribing, cycle=2
         let (_, e) = step(s, &Event::SttDone { cycle: 2, outcome: SttOutcome::Text("新文本".into()) });
-        assert_eq!(e, vec![Effect::Deliver(SttOutcome::Text("新文本".into()))]);
+        assert_eq!(e, vec![Effect::Deliver { outcome: SttOutcome::Text("新文本".into()), cycle: 2 }]);
     }
 
     #[test]
@@ -288,7 +291,7 @@ mod tests {
         };
         let (s2, e) = step(s, &Event::SttDone { cycle: 1, outcome: outcome.clone() });
         assert_eq!(s2.phase, Phase::Idle);
-        assert_eq!(e, vec![Effect::Deliver(outcome)]);
+        assert_eq!(e, vec![Effect::Deliver { outcome, cycle: 1 }]);
     }
 
     #[test]

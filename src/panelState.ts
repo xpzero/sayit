@@ -32,6 +32,47 @@ export function injectedOk(ev: Extract<PanelEvent, { type: "result" }>): boolean
   return !ev.error && ev.injected === true;
 }
 
+/** 听写期的相位视图（Panel 的固定布局 live-row 唯一数据源）：kind → 是否听写期 + 状态灯档位。
+ *  映射错一档 = 用户看到错误状态名，断言在 panelState.test.ts */
+export type Lamp = { live: boolean; dot: "" | "warm" | "live" | "busy"; label: string };
+export function lampOf(kind: PanelState["kind"]): Lamp {
+  switch (kind) {
+    case "opening":
+      return { live: true, dot: "warm", label: "唤醒中" };
+    case "recording":
+      return { live: true, dot: "live", label: "录音中" };
+    case "transcribing":
+      return { live: true, dot: "busy", label: "识别中" };
+    default:
+      return { live: false, dot: "", label: "" };
+  }
+}
+
+/** 结果徽标键：后端 reason（commands.rs deliver）→ 前端徽标分支，单一事实源。
+ *  任一侧 typo = 徽标静默落默认——纯函数 + 断言把这类错挡在测试层 */
+export type BadgeKey =
+  | "injected"
+  | "accessibility"
+  | "clipboard_failed"
+  | "no_input_focus"
+  | "focus_unknown"
+  | "miss";
+export function badgeKeyOf(r: { injected?: boolean | null; reason?: string | null }): BadgeKey {
+  if (r.injected) return "injected";
+  switch (r.reason) {
+    case "accessibility":
+      return "accessibility";
+    case "clipboard_failed":
+      return "clipboard_failed";
+    case "no_input_focus":
+      return "no_input_focus";
+    case "focus_unknown":
+      return "focus_unknown";
+    default:
+      return "miss";
+  }
+}
+
 export function nextState(s: PanelState, ev: PanelEvent): PanelState {
   switch (ev.type) {
     case "recording":

@@ -562,38 +562,26 @@ select {
 body:has(.panel-root) {
   background: transparent;
 }
-/* 收缩包裹胶囊：窗口尺寸 = 胶囊 + 阴影呼吸边距（ResizeObserver 上报这个盒子的尺寸）。
-   必须用 max-content 而非 fit-content：后者会被旧窗口宽度压住 → 文字折行 →
-   量到折行后的窄尺寸 → 窗口缩窄 → 永远卡在折叠状态 */
+/* 高度链必须一路贯通到 #root（React 挂载点）：断在任何一环，.panel-root 的
+   height:100% 都按 auto 塌缩 → 胶囊贴窗口顶而非贴底（三轮审查 D1 实锤） */
+html:has(.panel-root),
+body:has(.panel-root),
+#root:has(.panel-root) {
+  height: 100%;
+}
+/* 固定尺寸窗口（520×170，见 tauri.conf.json 与 AGENTS.md）：root 铺满窗口，
+   胶囊贴底居中。窗口几何永不变化 = 状态切换只剩 CSS 动效，零抖动的根基。
+   代价：胶囊四周的透明死区在面板可见期间会吃掉鼠标点击（键盘不受影响，
+   focusable:false），文本超长由 line-clamp 截断（复制按钮拿全文） */
 .panel-root {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   justify-content: center;
-  width: max-content;
-  margin: 0 auto;
+  width: 100%;
+  height: 100%;
   padding: 22px;
   box-sizing: border-box;
-  position: relative; /* 残影（绝对定位）以此盒为锚 */
-}
-/* 状态切换残影：旧胶囊快速淡出，与新胶囊的 pop-in 叠成柔和交叉溶解。
-   绝对定位 = 不参与布局，ResizeObserver 量到的永远只是新胶囊的尺寸——
-   窗口贴合照旧一步到位，动画不会引发二次重排/抖动 */
-.pill-ghost {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  animation: pill-exit 0.15s ease-out forwards;
-  pointer-events: none;
-}
-.pill-ghost .pill {
-  animation: none; /* 残影别再放一遍入场动画 */
-}
-@keyframes pill-exit {
-  to {
-    opacity: 0;
-  }
+  position: relative;
 }
 .pill {
   background: var(--paper);
@@ -604,55 +592,45 @@ body:has(.panel-root) {
   display: inline-flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: 6px;
+  /* 恒定胶囊：听写周期内本节点不卸载不重挂，无任何盒级动画（挂载动画/残影/scale
+     全部是历史抖动源，已拆）。统一脚印，内容居中填充 */
+  min-width: 176px;
+  min-height: 52px;
   max-width: 460px;
-  animation: pop-in 0.18s ease-out;
 }
 canvas.wave {
   width: 176px;
   height: 44px;
   display: block;
 }
-.pill-warn {
-  font-size: 11.5px;
-  color: var(--seal);
-  padding: 2px 6px;
+/* 听写期固定布局：声纹 + 状态灯同排共存（相位只改属性：灯色/文字，结构不变） */
+.live-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
-/* 识别中：三颗墨点依次浮沉的思考动效（不出文字，与声纹同色系） */
-.thinking {
-  display: inline-flex;
-  gap: 7px;
-  padding: 9px 12px;
-}
-.thinking i {
-  width: 9px;
-  height: 9px;
+.live-dot {
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
-  background: var(--seal);
-  animation: ink-dot 1.1s ease-in-out infinite;
+  background: var(--line-2);
+  animation: pill-pulse 1.1s ease-in-out infinite; /* 纯 opacity 呼吸：最安全的动画 */
 }
-.thinking i:nth-child(2) {
-  animation-delay: 0.18s;
+.live-dot.warm {
+  background: #d9a441; /* 唤醒中：琥珀 */
 }
-.thinking i:nth-child(3) {
-  animation-delay: 0.36s;
+.live-dot.live {
+  background: var(--seal); /* 录音中：朱砂 */
 }
-@keyframes ink-dot {
-  0%,
-  100% {
-    opacity: 0.25;
-    transform: translateY(0) scale(0.8);
-  }
-  40% {
-    opacity: 1;
-    transform: translateY(-3.5px) scale(1);
-  }
+.live-dot.busy {
+  background: #8a93a3; /* 识别中：青灰 */
 }
-.pill-text {
-  font-size: 12px;
+.live-label {
+  font-size: 11.5px;
   color: var(--muted);
-  padding: 2px 6px;
-  animation: pill-pulse 1.2s ease-in-out infinite;
+  width: 3.6em; /* 三字标签恒宽：换文案零布局变化 */
 }
 @keyframes pill-pulse {
   0%,
@@ -670,6 +648,11 @@ canvas.wave {
   word-break: break-all;
   color: var(--ink);
   padding: 2px 8px;
+  /* 固定窗口高度有限：超长文本截断展示（全文永远在剪贴板/复制按钮里） */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .pill-error {
   font-size: 12.5px;
@@ -677,6 +660,11 @@ canvas.wave {
   text-align: center;
   color: var(--seal);
   padding: 2px 8px;
+  /* 同 .pill-result-text：固定窗口内的截断展示 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .result-actions {
   display: flex;
@@ -711,17 +699,6 @@ canvas.wave {
   background: #fdf8ef;
   border-color: #f2dfb9;
 }
-@keyframes pop-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
 /* 窄窗口：侧栏收成纯图标 */
 @media (max-width: 720px) {
   .rail {
