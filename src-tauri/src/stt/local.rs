@@ -31,7 +31,12 @@ pub fn transcribe(app: &AppHandle, cfg: &Config, wav: &Path) -> Result<String, S
         item.mmproj_path.as_deref(),
     )?;
 
-    // 3) 干活：multipart 上传 WAV，收回 JSON
+    // 3) 干活
+    post_transcribe(port, wav)
+}
+
+/// 传输层：multipart 上传 WAV 给 llama-server，收回正文（与引擎管理解耦，可独立测试）
+pub fn post_transcribe(port: u16, wav: &Path) -> Result<String, String> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .build()
@@ -264,5 +269,113 @@ pub fn reap_orphan_engines(app: &AppHandle) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 标记剥离_有标记取正文_无标记去首尾空白() {
+        assert_eq!(strip_marker("language Chinese<asr_text>你好世界"), "你好世界");
+        assert_eq!(strip_marker("  干净文本  "), "干净文本");
+        assert_eq!(strip_marker(""), "");
+    }
+
+    // 进程守卫：测试任何路径退出（含断言失败）都带走 llama-server
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// 数据级 E2E：已知内容的真实语音 WAV → 独立拉起 llama-server → post_transcribe →
+    /// 断言转写包含已知关键词。只断"非空"测的是链路通；关键词断的是链路对（复核 P1 修正）。
+    /// fixture 不入库（含真实语音）：从 recordings 拷一段**已知说了什么**的录音为
+    /// tests/fixtures/e2e.wav，并把下方 EXPECTED 关键词改成那句里的稳定词。
+    #[test]
+    #[ignore = "数据级 E2E：需本地模型与 llama-server（cargo test -- --ignored 显式跑）"]
+    fn e2e_本地识别链路_真实音频到文本() {
+        // 当前 fixture 内容："我在对着，非输入态的内容在说话，但是好像不太对。"
+        const EXPECTED: &str = "输入";
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/e2e.wav");
+        assert!(
+            fixture.exists(),
+            "缺少 fixture（{}）——从 recordings 拷一段真实语音过来，并更新 EXPECTED 关键词",
+            fixture.display()
+        );
+        let home = std::env::var("HOME").unwrap();
+        let app_dir = std::path::Path::new(&home).join("Library/Application Support/com.sayit.app");
+        let cfg: crate::config::Config = serde_json::from_reader(
+            std::fs::File::open(app_dir.join("config.json")).expect("读 config.json"),
+        )
+        .expect("解析 config.json");
+        let model_id = cfg.stt.local_model_id.expect("未配置本地模型");
+        let model = crate::models::catalog()
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .unwrap_or_else(|| panic!("模型 {model_id} 不在精选清单——E2E 暂只支持精选模型"));
+        let dir = app_dir.join("models").join(&model_id);
+        let model_path = dir.join(&model.files[0].filename);
+        let mmproj = dir.join(&model.files[1].filename);
+        assert!(model_path.exists() && mmproj.exists(), "模型文件缺失");
+
+        // 引擎定位：与应用三级候选一致（设置路径 → brew → 托管目录），都找不到才报错
+        let managed = app_dir.join("engines/llama.cpp/bin/llama-server");
+        let bin = cfg
+            .engine
+            .path
+            .clone()
+            .filter(|p| std::path::Path::new(p).exists())
+            .or_else(|| {
+                ["/opt/homebrew/bin/llama-server".to_string(), managed.display().to_string()]
+                    .into_iter()
+                    .find(|p| std::path::Path::new(p).exists())
+            })
+            .expect("找不到 llama-server（设置路径/brew/托管目录都没有）");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        // 引擎日志写临时文件：启动失败有的查（与应用落盘 llama-server.log 同理）
+        let log_path = std::env::temp_dir().join(format!("sayit-e2e-llama-{port}.log"));
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("建引擎日志");
+        // 从 spawn 起就交给守卫：健康等待期断言失败也带走引擎
+        let mut engine = KillOnDrop(
+            Command::new(&bin)
+                .arg("-m").arg(&model_path)
+                .arg("--mmproj").arg(&mmproj)
+                .arg("--host").arg("127.0.0.1")
+                .arg("--port").arg(port.to_string())
+                .arg("-c").arg("4096")
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(log_file))
+                .spawn()
+                .expect("启动 llama-server"),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !probe_health(port) {
+            // 进程先死就别傻等 120s（与应用 wait_health 同理）
+            if let Ok(Some(_)) = engine.0.try_wait() {
+                panic!("E2E 引擎进程提前退出——日志：{}", log_path.display());
+            }
+            assert!(Instant::now() < deadline, "引擎 120s 未就绪——日志：{}", log_path.display());
+            std::thread::sleep(Duration::from_millis(400));
+        }
+
+        let text = post_transcribe(port, &fixture).expect("识别请求失败");
+        eprintln!("E2E 识别结果：{text}");
+        assert!(
+            text.contains(EXPECTED),
+            "识别结果应包含已知关键词『{EXPECTED}』（fixture 内容变了就同步更新关键词）：{text}"
+        );
     }
 }

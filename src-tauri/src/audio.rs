@@ -2,7 +2,7 @@
 // 铁律：音频回调里只做"把样本倒进桶"（外加一个廉价的音量统计），
 // 打包 WAV、广播事件这些活都留给停止之后的普通线程。
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -147,7 +147,7 @@ impl RecordingHandle {
         let secs = count as f32 / native_rate as f32;
         // 整段峰值：一个非零样本都没有 = 全零假数据（权限被拒的麦只会送这个）——
         // 死麦判定放到停止时刻做，录音期间不打扰用户
-        let peak = native.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let pk = peak(&native);
 
         // 原生采样率 -> 16k 线性重采样
         let resampled = resample(&native, native_rate, TARGET_RATE);
@@ -166,20 +166,9 @@ impl RecordingHandle {
                 .unwrap_or_default()
                 .as_millis()
         ));
+        write_pcm_wav(&path, &pcm)?;
 
-        let spec = hound::WavSpec {
-            channels: 1,
-            sample_rate: TARGET_RATE,
-            bits_per_sample: 16,
-            sample_format: hound::SampleFormat::Int,
-        };
-        let mut w = hound::WavWriter::create(&path, spec).map_err(|e| e.to_string())?;
-        for s in pcm {
-            w.write_sample(s).map_err(|e| e.to_string())?;
-        }
-        w.finalize().map_err(|e| e.to_string())?;
-
-        Ok((path, secs, count, peak))
+        Ok((path, secs, count, pk))
     }
 }
 
@@ -194,10 +183,9 @@ pub fn selftest(ms: u64) -> Result<SelftestReport, String> {
     let handle = start()?;
     std::thread::sleep(Duration::from_millis(ms));
     let (samples, _) = handle.into_samples()?;
-    let peak = samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
     Ok(SelftestReport {
         samples: samples.len(),
-        peak,
+        peak: peak(&samples),
     })
 }
 
@@ -218,4 +206,65 @@ fn resample(input: &[f32], from: u32, to: u32) -> Vec<f32> {
         out.push(l + (r - l) * frac);
     }
     out
+}
+
+// 整段峰值（死麦判定：全零假数据的铁证）
+fn peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+}
+
+// 打包 16kHz/16bit 单声道 WAV（识别链路的输入格式）
+fn write_pcm_wav(path: &Path, pcm: &[i16]) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: TARGET_RATE,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut w = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
+    for s in pcm {
+        w.write_sample(*s).map_err(|e| e.to_string())?;
+    }
+    w.finalize().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 重采样_48k降16k_长度与幅度保持() {
+        let flat = vec![0.5f32; 480];
+        let out = resample(&flat, 48_000, 16_000);
+        assert_eq!(out.len(), 160);
+        assert!(out.iter().all(|s| (*s - 0.5).abs() < 1e-6), "常数序列应保幅");
+        // 48 个样本（48k 下的一个整周期）应精确落为 16 个
+        let sine: Vec<f32> = (0..48).map(|i| (i as f32 / 48.0 * std::f32::consts::TAU).sin()).collect();
+        assert_eq!(resample(&sine, 48_000, 16_000).len(), 16);
+    }
+
+    #[test]
+    fn 重采样_同率直通_空输入为空() {
+        let x = vec![0.1f32, 0.2, 0.3];
+        assert_eq!(resample(&x, 16_000, 16_000), x);
+        assert!(resample(&[], 48_000, 16_000).is_empty());
+    }
+
+    #[test]
+    fn 峰值_全零为零_非零取最大绝对值() {
+        assert_eq!(peak(&[0.0; 100]), 0.0);
+        assert_eq!(peak(&[0.1, -0.4, 0.2]), 0.4);
+    }
+
+    #[test]
+    fn wav打包回读一致() {
+        let path = std::env::temp_dir().join(format!("sayit-wav-test-{}.wav", std::process::id()));
+        let pcm: Vec<i16> = vec![0, 100, -200, 32767, -32768];
+        write_pcm_wav(&path, &pcm).unwrap();
+        let mut r = hound::WavReader::open(&path).unwrap();
+        assert_eq!((r.spec().sample_rate, r.spec().channels), (TARGET_RATE, 1));
+        let back: Vec<i16> = r.samples().map(|s| s.unwrap()).collect();
+        assert_eq!(back, pcm);
+        let _ = std::fs::remove_file(&path);
+    }
 }
