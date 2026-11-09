@@ -1,21 +1,11 @@
 // 悬浮面板 · 宣纸文人风
-// 录音态 = 纯声纹（无文字）；文字只出现在唤醒中 / 警告 / 识别中 / 结果
+// 录音态 = 纯声纹（无文字）；文字只出现在唤醒中 / 识别中 / 结果。
+// 状态迁移一律过 panelState.ts 的 nextState（纯函数，断言在 panelState.test.ts）；
+// 这里的监听器只做副作用：计时器、关窗、电平引用。
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-
-type PanelState =
-  | { kind: "idle" }
-  | { kind: "opening" } // 开麦进行中（设备唤醒可到秒级）：加载动效，正式开录才亮声纹
-  | { kind: "recording" }
-  | { kind: "transcribing"; note?: string }
-  | {
-      kind: "result";
-      text?: string;
-      error?: string;
-      injected?: boolean | null;
-      reason?: string | null;
-    };
+import { injectedOk, nextState, type PanelState } from "./panelState";
 
 const BARS = 30;
 
@@ -56,15 +46,23 @@ export default function Panel() {
         if (e.payload.active) {
           if (hideTimer.current) clearTimeout(hideTimer.current); // 新录音取消自动收起
           ampRef.current = 0;
-          // opening = 设备唤醒中，先给加载态；正式开录事件（不带 opening）再来时切成声纹
-          setState(e.payload.opening ? { kind: "opening" } : { kind: "recording" });
-        } else {
-          setState({ kind: "idle" }); // Esc 中止等场景：复位，避免声纹冻结在屏幕上
         }
+        setState((prev) =>
+          nextState(prev, {
+            type: "recording",
+            active: e.payload.active,
+            opening: e.payload.opening,
+          }),
+        );
       }),
       listen<{ stage: string; note?: string }>("phase", (e) => {
-        if (e.payload.stage === "transcribing")
-          setState({ kind: "transcribing", note: e.payload.note });
+        setState((prev) =>
+          nextState(prev, {
+            type: "phase",
+            stage: e.payload.stage,
+            note: e.payload.note,
+          }),
+        );
       }),
       listen<{
         text?: string;
@@ -72,19 +70,22 @@ export default function Panel() {
         injected?: boolean;
         reason?: string | null;
       }>("result", (e) => {
-        // 注入成功：文字已落进用户光标处，面板即刻收起
-        if (!e.payload.error && e.payload.injected === true) {
-          setState({ kind: "idle" });
-          invoke("hide_panel").catch(() => {});
-          return;
-        }
-        setState({
-          kind: "result",
+        const ev = {
+          type: "result",
           text: e.payload.text,
           error: e.payload.error,
           injected: e.payload.injected,
           reason: e.payload.reason,
-        });
+        } as const;
+        setState((prev) => nextState(prev, ev));
+        // 注入成功：文字已落进用户光标处，面板即刻收起（判据与 nextState 共用一处）
+        if (injectedOk(ev)) {
+          invoke("hide_panel").catch(() => {});
+          return;
+        }
+        // 失败/未注入：结果胶囊停 autoHide 秒。先清旧定时器——连发 result（如无模型
+        // 冷启动不走 recording 事件）时，残留的旧 timer 会提前收起新结果
+        if (hideTimer.current) clearTimeout(hideTimer.current);
         hideTimer.current = setTimeout(() => {
           invoke("hide_panel").catch(() => {});
         }, autoHide.current * 1000);
@@ -221,6 +222,8 @@ export default function Panel() {
                   >
                     未插入 · 去开辅助功能权限
                   </button>
+                ) : state.reason === "clipboard_failed" ? (
+                  <span className="injected-badge miss">未自动插入 · 剪贴板暂不可用，请手动复制</span>
                 ) : (
                   <span className="injected-badge miss">未自动插入 · 文本在剪贴板</span>
                 )}

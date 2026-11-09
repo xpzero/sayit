@@ -324,6 +324,25 @@ fn deliver(app: &AppHandle, cfg: &config::Config, outcome: crate::dictation::Stt
             let mode = cfg.injection.mode.clone();
             let app3 = app.clone();
             let _ = app.run_on_main_thread(move || {
+                // 前台是 Finder（桌面场景）⌘V 只会打进虚空、注入还会谎报成功——
+                // 不注入，文本进剪贴板 + 结果胶囊亮复制按钮让用户自己落位。
+                // 判定走 NSWorkspace（无需权限，见 inject.rs），任何失败一律放行注入
+                if crate::inject::frontmost_is_finder() {
+                    // 剪贴板写失败要换徽标——不能一边失败一边承诺"文本在剪贴板"
+                    let cb_failed = crate::inject::copy_to_clipboard(&text).is_err();
+                    if cb_failed {
+                        eprintln!("[inject] 桌面回退写剪贴板失败");
+                    }
+                    let _ = app3.emit(
+                        "result",
+                        serde_json::json!({
+                            "text": text,
+                            "injected": false,
+                            "reason": if cb_failed { "clipboard_failed" } else { "no_input_focus" }
+                        }),
+                    );
+                    return;
+                }
                 let outcome = if mode == "type" {
                     crate::inject::type_text(&text)
                 } else {
