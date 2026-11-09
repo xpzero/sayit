@@ -76,8 +76,23 @@ fn toggle_core(app: &AppHandle, state: &State<'_, crate::state::SharedState>) ->
             .app_data_dir()
             .map_err(|e| e.to_string())?
             .join("recordings");
-        let (wav, secs, samples) = handle.stop(&out_dir)?;
+        let (wav, secs, samples, peak) = handle.stop(&out_dir)?;
         drop(level_slot);
+
+        // 整段录音一个非零样本都没有 = 全零假数据（权限被拒的麦只会送这个）。
+        // 识别纯静音毫无意义，直接给结论——死麦判定归位到停止时刻，录音期间不打扰
+        if peak < 0.0001 {
+            println!("[toggle] 录音全程无声（峰值 0）：麦克风多半未授权/被占用");
+            let _ = std::fs::remove_file(&wav); // 静音音频不留盘
+            let _ = app.emit(
+                "result",
+                serde_json::json!({
+                    "error": "没采到任何声音——麦克风可能未授权或被系统静音",
+                    "reason": "silent_mic"
+                }),
+            );
+            return Ok(());
+        }
 
         println!(
             "[toggle] 录音完成：{:.1}s / {} 原始采样 -> {}",
@@ -91,11 +106,20 @@ fn toggle_core(app: &AppHandle, state: &State<'_, crate::state::SharedState>) ->
         // 主线程被识别堵住的话"识别中"事件永远到不了页面（现象：加载态从未出现）。
         // 注入恰好相反——enigo→HIToolbox 是 main-thread-only，识别完再派回主线程。
         let cfg2 = config::load(app);
+        let my_cycle = CYCLE.load(Ordering::Relaxed); // 结果只属于本次听写：期间有人开了新篇就作废
         let app2 = app.clone();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
+            let stale = || CYCLE.load(Ordering::Relaxed) != my_cycle;
             match crate::stt::transcribe(&app2, &cfg2, &wav) {
                 Ok(text) => {
+                    if stale() {
+                        println!(
+                            "[stt] 识别完成（用时 {:.1}s）但已被新一轮听写取代，结果丢弃",
+                            started.elapsed().as_secs_f32()
+                        );
+                        return; // 迟到的注入会污染新现场，什么都不做才是对的
+                    }
                     println!(
                         "[stt] 识别完成，用时 {:.1}s：{}",
                         started.elapsed().as_secs_f32(),
@@ -128,6 +152,9 @@ fn toggle_core(app: &AppHandle, state: &State<'_, crate::state::SharedState>) ->
                     });
                 }
                 Err(e) => {
+                    if stale() {
+                        return; // 翻篇后的错误同样不必打扰新现场
+                    }
                     eprintln!("[stt] 识别失败：{e}");
                     let _ = app2.emit("result", serde_json::json!({ "error": e }));
                 }
@@ -150,54 +177,101 @@ fn toggle_core(app: &AppHandle, state: &State<'_, crate::state::SharedState>) ->
             }
         }
 
-        // ---- 开始：开麦 -> 唤起面板 ----
-        // RECORDING 先置位再开麦：audio::start()（设备唤醒可到秒级）期间按 Esc 也要能中止
+        // ---- 开始：先见面板（加载态）-> 后台开麦 -> 正式开录后再亮声纹 ----
+        // audio::start() 可阻塞秒级（USB/蓝牙唤醒实测 ~0.6s，蓝牙更久），绝不能抱着主线程：
+        // 面板渲染和事件投递都要过主线程事件循环。开麦挪进后台线程，面板先显示"唤醒中"。
+        // OPENING 闩锁：开麦进行中忽略重复触发（此时既没有流可停，也不该开第二个）。
+        if OPENING.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        drop(s); // 启动路径拿锁只为判断"是否有流在录"；开麦本身不再需要它
+        // 新听写开篇 = 上一段还在跑的识别就此作废（用户已翻篇）
+        CYCLE.fetch_add(1, Ordering::Relaxed);
+        // RECORDING 先置位再开麦：等待期间按 Esc 也要能中止
         RECORDING.store(true, Ordering::Relaxed);
-        let handle = match audio::start() {
-            Ok(h) => h,
-            Err(e) => {
-                RECORDING.store(false, Ordering::Relaxed);
-                return Err(e);
-            }
-        };
-        s.level = Some(handle.level.clone());
-        s.broadcasting.store(true, Ordering::Relaxed);
-        let flag = s.broadcasting.clone();
-        let level = handle.level.clone();
-        s.recording = Some(handle);
-        drop(s); // 不抱着锁干活
-
-        // 音量广播线程：每 50ms 推音量；附带死麦检测（全程没采到过声音 → 2 秒后警告）
-        // 这是麦克风攻坚战换来的教训：权限被拒时 macOS 给"全零假数据"，必须主动识破。
-        // 注意只看"从头到尾没响过"：说过话之后停下不该再警告（那是正常停顿，不是死麦）
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            let mut silent_since = std::time::Instant::now();
-            let mut warned = false;
-            let mut heard = false; // 本次录音是否采到过声音
-            while flag.load(Ordering::Relaxed) {
-                let v = level.load(Ordering::Relaxed) as f32 / 1000.0;
-                let _ = app2.emit("level", serde_json::json!({ "rms": v }));
-                if v > 0.006 {
-                    heard = true;
-                    if warned {
-                        let _ = app2.emit("silence", serde_json::json!({ "active": false }));
-                        warned = false;
-                    }
-                    silent_since = std::time::Instant::now();
-                } else if !warned && !heard && silent_since.elapsed() >= Duration::from_secs(2) {
-                    let _ = app2.emit("silence", serde_json::json!({ "active": true }));
-                    warned = true;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
 
         show_panel(app);
         let _ = app.emit(
             "recording",
-            serde_json::json!({ "active": true, "model": display_model(&cfg) }),
+            serde_json::json!({ "active": true, "opening": true, "model": display_model(&cfg) }),
         );
+
+        let app2 = app.clone();
+        std::thread::spawn(move || {
+            // 第一次失败先别急着报错：瞬态驱动故障（USB 声卡 StartIO 被拒之类）通常亚秒自愈，
+            // 歇 500ms 重试一次；仍失败才以第一次的错误示人（第一次的更贴近根因）
+            let handle = match audio::start() {
+                Ok(h) => h,
+                Err(first) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    match audio::start() {
+                        Ok(h) => h,
+                        Err(_) => {
+                            OPENING.store(false, Ordering::Relaxed);
+                            RECORDING.store(false, Ordering::Relaxed);
+                            eprintln!("[toggle] 开麦失败（已重试一次）：{first}");
+                            // 面板已可见，错误直接进结果位（与旧路径同样的可见性）
+                            let _ = app2.emit("result", serde_json::json!({ "error": first }));
+                            return;
+                        }
+                    }
+                }
+            };
+
+            let state = app2.state::<crate::state::SharedState>();
+            let Ok(mut s) = state.lock() else {
+                drop(handle);
+                OPENING.store(false, Ordering::Relaxed);
+                RECORDING.store(false, Ordering::Relaxed);
+                return;
+            };
+            // 等待期间被 Esc 中止：刚拿到手的流直接丢弃，不留状态、不留文件
+            if !RECORDING.load(Ordering::Relaxed) {
+                drop(s);
+                drop(handle);
+                OPENING.store(false, Ordering::Relaxed);
+                return;
+            }
+            s.level = Some(handle.level.clone());
+            s.broadcasting.store(true, Ordering::Relaxed);
+            let flag = s.broadcasting.clone();
+            let level = handle.level.clone();
+            let live = handle.live.clone();
+            s.recording = Some(handle);
+            // 撤闩要在锁内（stop 分支拿同一把锁，此后触发/停止判定就不会错位）
+            OPENING.store(false, Ordering::Relaxed);
+            drop(s); // 不抱着锁干活
+
+            // 音量广播 + 开录判定，二合一（每 50ms 一个节拍）：
+            // 1) 开麦期间照常推音量（面板在加载态，暂不消费）；
+            // 2) "正式开录"（面板加载态切声纹）= 首个真实信号（RMS 超过死麦线）。注意不是
+            //    "第一个回调"：play() 成功后回调就在跑，但设备预热期送的是零数据（本机实测
+            //    再 ~0.5s 才来真信号），此刻说的话不会被采样——"看到声纹=可以说话"才是
+            //    可信承诺。2 秒兜底：设备只送全零（权限被拒）或首帧奇慢也不能永远卡在加载态。
+            // 录音期间不做任何"没声音"式打扰——录多久、说不说是用户的事；死麦（全零假数据）
+            // 的判定归位到停止时刻（见 stop 分支的 peak 检查），结论在结果位说。
+            let model = display_model(&cfg);
+            let app3 = app2.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let mut armed = false; // 已发出"可以说话"的承诺（真实信号或 2s 兜底）
+                while flag.load(Ordering::Relaxed) {
+                    let v = level.load(Ordering::Relaxed) as f32 / 1000.0;
+                    let _ = app3.emit("level", serde_json::json!({ "rms": v }));
+                    if !armed
+                        && (live.load(Ordering::Relaxed)
+                            || started.elapsed() >= Duration::from_secs(2))
+                    {
+                        armed = true;
+                        let _ = app3.emit(
+                            "recording",
+                            serde_json::json!({ "active": true, "model": model }),
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+        });
         Ok(())
     }
 }
@@ -234,7 +308,7 @@ pub fn abort_recording_impl(app: &AppHandle) {
         drop(s); // 不抱着锁干活
 
         if let Ok(dir) = app.path().app_data_dir().map(|d| d.join("recordings")) {
-            if let Ok((wav, _secs, _samples)) = handle.stop(&dir) {
+            if let Ok((wav, _secs, _samples, _peak)) = handle.stop(&dir) {
                 let _ = std::fs::remove_file(&wav); // 半句话没说完，音频直接丢弃
             }
         }
@@ -324,8 +398,16 @@ fn open_accessibility_page(app: &AppHandle) -> Result<(), String> {
 }
 
 // 录音进行中的无锁标志：tap 回调要读它（Esc 中止判断），不能去碰 SharedState 的互斥锁——
-// toggle_core 抱着锁跑 audio::start()（蓝牙设备唤醒可到秒级），回调等锁超时会被系统禁用 tap
+// 回调等锁超时会被系统禁用 tap。开麦/收麦期间它也兼作"等待中"状态位
 pub(crate) static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// 开麦进行中（audio::start 在后台线程跑）：闩住重复触发；由开麦线程独占置位/复位
+static OPENING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+// 听写周期号：每开始一次新听写 +1。识别是后台慢活（本地可到数十秒），完成时若发现
+// 周期已翻篇，结果与错误一概丢弃——迟到的注入会把旧文字敲进用户正在用的新输入现场，
+// 结果事件还会把面板从新录音态硬掰走（实测：连续两段听写间隔 2 秒即可复现）
+static CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // 自动带路的节流开关：每次运行只自动打开一次（反复弹设置页会烦人）
 static AUTO_OPENED_ACCESSIBILITY: std::sync::atomic::AtomicBool =
@@ -484,15 +566,13 @@ fn center_panel_bottom(win: &tauri::WebviewWindow, w: f64, h: f64) {
 }
 
 // 出场防闪帧：show_panel 不再直接显示，而是等第一次尺寸贴合完成（内容已按新状态渲染、
-// 窗口已瞬移到正确尺寸）再 show——否则会先以旧尺寸（上次的结果胶囊）闪一帧再跳变 = 抖动。
+// 窗口已瞬移到正确尺寸）再 show——否则会先以旧尺寸（上次的结果胶囊）闪一帧再跳变。
 static SHOW_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn show_panel(app: &AppHandle) {
     let Some(win) = app.get_webview_window("panel") else {
         return;
     };
-    // 出场后的第一次尺寸贴合要瞬移（不做动画），否则"旧尺寸→新尺寸"的变形全程可见 = 抖动
-    SNAP_FIRST.store(true, std::sync::atomic::Ordering::Relaxed);
     if !win.is_visible().unwrap_or(false) {
         SHOW_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
         // 兜底：内容迟迟不报尺寸（隐藏 webview 可能不排版）就按当前尺寸显示，绝不能永远藏着
@@ -529,12 +609,11 @@ fn show_panel(app: &AppHandle) {
     }
 }
 
-// 前端 ResizeObserver 报来内容尺寸（CSS 逻辑像素）：
-// - 隐藏时 / 出场后第一次 / 窗口不可见 → 瞬移贴合（不可见，直接摆好）
-// - 可见状态之间切换 → ~110ms easeOut 缓动，底部居中锚定，消除"声纹→识别中→结果"硬切
-static RESIZE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static SNAP_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+// 前端 ResizeObserver 报来内容尺寸（CSS 逻辑像素），窗口一步贴合到位。
+// 刻意不做步进动画：曾试过 6 步 easeOut 渐变（每步 18ms 各调一次 set_size + set_position），
+// 窗口服务与 DOM 重排各走各的节拍，步进途中窗口尺寸 ≠ 胶囊自然尺寸，flex 居中让
+// 胶囊在屏上每步挪一点 = 状态切换时的肉眼抖动。窗口本身透明无边框、边缘不可见，
+// 瞬移是唯一不抖的做法。
 #[tauri::command]
 pub fn resize_panel(app: AppHandle, w: f64, h: f64) {
     let Some(win) = app.get_webview_window("panel") else {
@@ -542,43 +621,12 @@ pub fn resize_panel(app: AppHandle, w: f64, h: f64) {
     };
     let w = w.max(40.0);
     let h = h.max(40.0);
-    let snap = !win.is_visible().unwrap_or(true) || SNAP_FIRST.swap(false, std::sync::atomic::Ordering::Relaxed);
-    let seq = RESIZE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    if snap {
-        let _ = win.set_size(tauri::LogicalSize::new(w, h));
-        center_panel_bottom(&win, w, h);
-        // 出场流程的收尾：尺寸已就位，此刻显示就不会闪旧帧
-        if SHOW_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let _ = win.show();
-        }
-        return;
+    let _ = win.set_size(tauri::LogicalSize::new(w, h));
+    center_panel_bottom(&win, w, h);
+    // 出场流程的收尾：尺寸已就位，此刻显示就不会闪旧帧
+    if SHOW_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = win.show();
     }
-    std::thread::spawn(move || {
-        let sf = win
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .map(|m| m.scale_factor())
-            .unwrap_or(2.0);
-        let start = win
-            .outer_size()
-            .ok()
-            .map(|s| (s.width as f64 / sf, s.height as f64 / sf))
-            .unwrap_or((w, h));
-        const STEPS: i32 = 6;
-        for i in 1..=STEPS {
-            if RESIZE_GEN.load(std::sync::atomic::Ordering::Relaxed) != seq {
-                return; // 有新目标尺寸进来，本次渐变让位
-            }
-            let t = i as f64 / STEPS as f64;
-            let e = 1.0 - (1.0 - t) * (1.0 - t); // easeOutQuad
-            let cw = start.0 + (w - start.0) * e;
-            let ch = start.1 + (h - start.1) * e;
-            let _ = win.set_size(tauri::LogicalSize::new(cw, ch));
-            center_panel_bottom(&win, cw, ch);
-            std::thread::sleep(std::time::Duration::from_millis(18));
-        }
-    });
 }
 
 fn display_model(cfg: &Config) -> String {

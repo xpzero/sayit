@@ -573,6 +573,27 @@ body:has(.panel-root) {
   margin: 0 auto;
   padding: 22px;
   box-sizing: border-box;
+  position: relative; /* 残影（绝对定位）以此盒为锚 */
+}
+/* 状态切换残影：旧胶囊快速淡出，与新胶囊的 pop-in 叠成柔和交叉溶解。
+   绝对定位 = 不参与布局，ResizeObserver 量到的永远只是新胶囊的尺寸——
+   窗口贴合照旧一步到位，动画不会引发二次重排/抖动 */
+.pill-ghost {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: pill-exit 0.15s ease-out forwards;
+  pointer-events: none;
+}
+.pill-ghost .pill {
+  animation: none; /* 残影别再放一遍入场动画 */
+}
+@keyframes pill-exit {
+  to {
+    opacity: 0;
+  }
 }
 .pill {
   background: var(--paper);

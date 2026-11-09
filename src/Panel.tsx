@@ -1,11 +1,12 @@
 // 悬浮面板 · 宣纸文人风
-// 录音态 = 纯声纹（无文字）；文字只出现在警告 / 识别中 / 结果
-import { useEffect, useRef, useState } from "react";
+// 录音态 = 纯声纹（无文字）；文字只出现在唤醒中 / 警告 / 识别中 / 结果
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 type PanelState =
   | { kind: "idle" }
+  | { kind: "opening" } // 开麦进行中（设备唤醒可到秒级）：加载动效，正式开录才亮声纹
   | { kind: "recording" }
   | { kind: "transcribing"; note?: string }
   | {
@@ -20,7 +21,6 @@ const BARS = 30;
 
 export default function Panel() {
   const [state, setState] = useState<PanelState>({ kind: "idle" });
-  const [silent, setSilent] = useState(false);
   const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoHide = useRef(5); // 面板自动收起秒数（启动时从配置读）
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -52,12 +52,12 @@ export default function Panel() {
     });
 
     const unsubs: Promise<UnlistenFn>[] = [
-      listen<{ active: boolean }>("recording", (e) => {
+      listen<{ active: boolean; opening?: boolean }>("recording", (e) => {
         if (e.payload.active) {
           if (hideTimer.current) clearTimeout(hideTimer.current); // 新录音取消自动收起
-          setState({ kind: "recording" });
-          setSilent(false);
           ampRef.current = 0;
+          // opening = 设备唤醒中，先给加载态；正式开录事件（不带 opening）再来时切成声纹
+          setState(e.payload.opening ? { kind: "opening" } : { kind: "recording" });
         } else {
           setState({ kind: "idle" }); // Esc 中止等场景：复位，避免声纹冻结在屏幕上
         }
@@ -92,18 +92,17 @@ export default function Panel() {
       listen<{ rms: number }>("level", (e) => {
         ampRef.current = e.payload.rms;
       }),
-      listen<{ active: boolean }>("silence", (e) => {
-        setSilent(e.payload.active);
-        // 死麦警告亮 3 秒自动消隐（后台 warned 闩锁保证一次录音只提醒一次）
-        if (e.payload.active) {
-          setTimeout(() => setSilent(false), 3000);
-        }
-      }),
     ];
     return () => unsubs.forEach((u) => u.then((f) => f()));
   }, []);
 
-  const waveActive = state.kind === "recording" && !silent;
+  const waveActive = state.kind === "recording";
+
+  // 状态切换的残影：旧胶囊保留 150ms 绝对定位淡出（不参与布局与尺寸上报，窗口只认
+  // flow 里的新胶囊），与新胶囊的 pop-in 叠成柔和的交叉溶解——旧节点直接卸载会
+  // "啪"地消失，这正是状态切换生硬感的来源
+  const [ghost, setGhost] = useState<ReactNode>(null);
+  const prevPillRef = useRef<{ kind: PanelState["kind"]; node: ReactNode } | null>(null);
 
   // 声纹动画：canvas 挂载期间运行（录音态才渲染 canvas，故以 waveActive 为依赖）
   useEffect(() => {
@@ -160,33 +159,34 @@ export default function Panel() {
     return () => cancelAnimationFrame(raf);
   }, [waveActive]);
 
-  return (
-    <div className="panel-root" ref={rootRef}>
-      {waveActive && (
-        <div className="pill">
-          <canvas ref={canvasRef} className="wave" width={352} height={88} aria-label="录音声纹" />
-        </div>
-      )}
-
-      {state.kind === "recording" && silent && (
-        <div className="pill">
-          <span className="pill-warn">未听到声音 · 检查麦克风</span>
-        </div>
-      )}
-
-      {state.kind === "transcribing" && (
-        <div className="pill">
-          <span className="thinking" aria-label="识别中">
-            <i />
-            <i />
-            <i />
-          </span>
-          {/* 冷启动等罕见场景仍保留说明文字（平时只有动效） */}
-          {state.note && <span className="pill-text">{state.note}</span>}
-        </div>
-      )}
-
-      {state.kind === "result" && (
+  const pill: ReactNode =
+    (state.kind === "opening" && (
+      <div className="pill">
+        <span className="thinking" aria-label="正在唤醒麦克风">
+          <i />
+          <i />
+          <i />
+        </span>
+        <span className="pill-text">正在唤醒麦克风…</span>
+      </div>
+    )) ||
+    (waveActive && (
+      <div className="pill">
+        <canvas ref={canvasRef} className="wave" width={352} height={88} aria-label="录音声纹" />
+      </div>
+    )) ||
+    (state.kind === "transcribing" && (
+      <div className="pill">
+        <span className="thinking" aria-label="识别中">
+          <i />
+          <i />
+          <i />
+        </span>
+        {/* 冷启动等罕见场景仍保留说明文字（平时只有动效） */}
+        {state.note && <span className="pill-text">{state.note}</span>}
+      </div>
+    )) ||
+    (state.kind === "result" && (
         <div className="pill result">
           {state.error ? (
             <>
@@ -197,6 +197,14 @@ export default function Panel() {
                   onClick={() => invoke("open_settings", { tab: "model" }).catch(() => {})}
                 >
                   去模型库下载 →
+                </button>
+              )}
+              {state.reason === "silent_mic" && (
+                <button
+                  className="pill-btn"
+                  onClick={() => invoke("open_mic_settings").catch(() => {})}
+                >
+                  去系统设置检查麦克风 →
                 </button>
               )}
             </>
@@ -214,7 +222,7 @@ export default function Panel() {
                     未插入 · 去开辅助功能权限
                   </button>
                 ) : (
-                  <span className="injected-badge miss">未自动插入</span>
+                  <span className="injected-badge miss">未自动插入 · 文本在剪贴板</span>
                 )}
                 <button
                   className="pill-btn"
@@ -232,7 +240,25 @@ export default function Panel() {
             </>
           )}
         </div>
-      )}
+    ));
+
+  // 状态一变就把上一帧的胶囊立为残影（150ms 后自动撤除）；同态的内容更新则清掉旧残影
+  useEffect(() => {
+    const prev = prevPillRef.current;
+    prevPillRef.current = { kind: state.kind, node: pill };
+    if (prev && prev.kind !== state.kind && prev.node) {
+      setGhost(prev.node);
+      const t = setTimeout(() => setGhost(null), 150);
+      return () => clearTimeout(t);
+    }
+    setGhost(null);
+  }, [state]);
+
+  return (
+    <div className="panel-root" ref={rootRef}>
+      {/* 残影先渲染垫底，新胶囊盖上——交叉溶解由此而来 */}
+      {ghost !== null && <div className="pill-ghost">{ghost}</div>}
+      {pill}
     </div>
   );
 }

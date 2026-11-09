@@ -49,12 +49,16 @@ unsafe extern "C" {
 const SESSION_TAP: i32 = 1; // kCGSessionEventTap
 const HEAD_INSERT: i32 = 0; // kCGHeadInsertEventTap
 const LISTEN_ONLY: isize = 1; // kCGEventTapOptionListenOnly（CFIndex/isize）
-const MASK: u64 = (1 << 1) | (1 << 2) | (1 << 12); // keyDown | keyUp | flagsChanged
+// CGEvent 的事件类型编号（CGEventTypes.h）：keyDown=10、keyUp=11、flagsChanged=12。
+// 曾误写成 1/2/12——1/2 其实是左键按下/抬起（鼠标事件！）：tap 只看得见鼠标点击和 Fn，
+// 字母/数字/空格组合键与 Esc 中止全部失灵；鼠标点击还顶着"键码 0"的马甲混进
+// keyDown 通道（即 handle_key_down 里那只"幽灵键码 0"的真身）
+const MASK: u64 = (1 << 10) | (1 << 11) | (1 << 12); // keyDown | keyUp | flagsChanged
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFE1; // kCGEventTapDisabledByTimeout
 const TAP_DISABLED_BY_USER: u32 = 0xFFFF_FFE0; // kCGEventTapDisabledByUserInput
 
-const T_KEYDOWN: u32 = 1;
-const T_KEYUP: u32 = 2;
+const T_KEYDOWN: u32 = 10;
+const T_KEYUP: u32 = 11;
 const T_FLAGS_CHANGED: u32 = 12;
 
 const F_KEYCODE: isize = 9; // kCGKeyboardEventKeycode
@@ -198,7 +202,7 @@ fn handle_flags_changed(app: &AppHandle, keycode: i64, flags: u64) {
 
 fn handle_key_down(app: &AppHandle, kc: u16, flags: u64) {
     if kc == 0 {
-        return; // 幽灵键码（无人触碰也报，探针两轮实测）
+        return; // 键码 0 防御性丢弃（历史上是鼠标点击混进来的"幽灵键"；见 MASK 注释）
     }
     if is_modifier_keycode(kc) {
         // Fn+修饰键手势不算"Fn 单独按"（否则按 Fn+Shift、先松 Shift 再松 Fn 会误录成裸 Fn）

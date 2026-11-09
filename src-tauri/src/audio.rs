@@ -3,7 +3,7 @@
 // 打包 WAV、广播事件这些活都留给停止之后的普通线程。
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ pub struct RecordingHandle {
     stream: SendStream,
     buf: Arc<Mutex<SharedBuf>>,
     pub level: Arc<AtomicU32>, // RMS * 1000，广播线程每 50ms 读一次
+    pub live: Arc<AtomicBool>, // 已收到首个超过死麦线的真实信号 = 采集链路真的活了
     native_rate: u32,
 }
 
@@ -68,6 +69,7 @@ pub fn start() -> Result<RecordingHandle, String> {
         rms_idx: 0,
     }));
     let level = Arc::new(AtomicU32::new(0));
+    let live = Arc::new(AtomicBool::new(false));
 
     let stream = device
         .build_input_stream(
@@ -75,6 +77,7 @@ pub fn start() -> Result<RecordingHandle, String> {
             {
                 let buf = buf.clone();
                 let level = level.clone();
+                let live = live.clone();
                 move |data: &[f32], _| {
                     let mut b = match buf.lock() {
                         Ok(b) => b,
@@ -99,6 +102,12 @@ pub fn start() -> Result<RecordingHandle, String> {
                         let sum: f32 = chunk.iter().map(|s| s * s).sum();
                         let rms = (sum / chunk.len() as f32).sqrt();
                         level.store((rms * 1000.0) as u32, Ordering::Relaxed);
+                        // 设备预热会送一段"零数据"（play 成功后 ~0.5s，回调在跑但内容是零，
+                        // 实测本机 USB 耳机麦）——此刻说的话不会被采样。"开录"信号必须
+                        // 是首个超过死麦线（与死麦检测同一条线）的真实信号，加载态才熬得够久
+                        if !live.load(Ordering::Relaxed) && rms > 0.001 {
+                            live.store(true, Ordering::Relaxed);
+                        }
                         b.rms_idx = b.samples.len();
                     }
                 }
@@ -116,6 +125,7 @@ pub fn start() -> Result<RecordingHandle, String> {
         stream: SendStream(stream),
         buf,
         level,
+        live,
         native_rate,
     })
 }
@@ -129,12 +139,15 @@ impl RecordingHandle {
         Ok((native, self.native_rate))
     }
 
-    /// 停止录音并打包成 16kHz/16bit 单声道 WAV，返回 (文件路径, 时长秒, 采样数)
-    pub fn stop(self, out_dir: &PathBuf) -> Result<(PathBuf, f32, usize), String> {
+    /// 停止录音并打包成 16kHz/16bit 单声道 WAV，返回 (文件路径, 时长秒, 采样数, 峰值)
+    pub fn stop(self, out_dir: &PathBuf) -> Result<(PathBuf, f32, usize, f32), String> {
         let (native, native_rate) = self.into_samples()?;
         let count = native.len();
         // 时长（秒），随路径一起返回给调用方
         let secs = count as f32 / native_rate as f32;
+        // 整段峰值：一个非零样本都没有 = 全零假数据（权限被拒的麦只会送这个）——
+        // 死麦判定放到停止时刻做，录音期间不打扰用户
+        let peak = native.iter().fold(0.0f32, |m, s| m.max(s.abs()));
 
         // 原生采样率 -> 16k 线性重采样
         let resampled = resample(&native, native_rate, TARGET_RATE);
@@ -166,7 +179,7 @@ impl RecordingHandle {
         }
         w.finalize().map_err(|e| e.to_string())?;
 
-        Ok((path, secs, count))
+        Ok((path, secs, count, peak))
     }
 }
 
