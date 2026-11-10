@@ -65,6 +65,11 @@ pub fn frontmost_app() -> Option<(String, i32)> {
     None
 }
 
+// 剪贴板写入代数：任何经我们代码的写入（注入 / 显式复制 / 还原）都递增。
+// 还原线程在 sleep 后检查代数——如果有人（用户按复制按钮 / 第二次注入）在我们
+// 之后写入了剪贴板，代数已变，放弃还原（防止回滚用户的新内容，六轮审查 D2/D4/D6）。
+static CLIPBOARD_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn paste_text(text: &str) -> InjectOutcome {
     if !accessibility_ok() {
         return InjectOutcome::NeedPermission;
@@ -74,11 +79,14 @@ pub fn paste_text(text: &str) -> InjectOutcome {
         Err(e) => return InjectOutcome::Failed(format!("打不开剪贴板：{e}")),
     };
 
-    // paste 模式写剪贴板 = ⌘V 的机制要求，写入后不还原：
-    // 1) 备份/还原有先天竞态：还原太早，目标应用（网页/Electron 的慢事件循环）还没
-    //    读剪贴板，用户粘到的反而是"旧内容"——实测踩坑；
-    // 2) 注入落空（罕见：确认输入态后焦点瞬移）时文字恰好在剪贴板，⌘V 可取。
-    // 代价：注入这一次覆盖剪贴板——机械制要求，剪贴板最小侵入政策下的唯一例外。
+    // paste 模式写剪贴板 = ⌘V 的机制要求。备份 → 注入 → 延迟还原（用户要求恢复此行为，
+    // 2026-11-10 曾因竞态移除——还原太早目标 App 还没读完，粘到旧内容。现三重保护：
+    // ① 500ms 延迟覆盖 Electron 慢事件循环；② 代数计数器——还原前发现有人（复制按钮/
+    // 下一轮注入）写过剪贴板则放弃；③ 文本比对——只在剪贴板仍是我们写入的文本时还原）。
+    // 限制：仅备份/还原纯文本；图片/富文本（RTF 格式信息）不还原，我们的文字留作兜底。
+    let backup = cb.get_text().ok();
+    let my_gen = CLIPBOARD_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     if let Err(e) = cb.set_text(text.to_string()) {
         return InjectOutcome::Failed(format!("写剪贴板失败：{e}"));
     }
@@ -86,7 +94,32 @@ pub fn paste_text(text: &str) -> InjectOutcome {
     // 模拟 Cmd+V（面板 focusable:false，焦点仍在用户原来的应用里）
     if let Err(e) = press_cmd_v() {
         return InjectOutcome::Failed(format!("模拟按键失败：{e}"));
+        // 注意：此处剪贴板已写入但无还原线程——听写文字留在剪贴板恰好是注入失败的
+        // 合理兜底（面板亮复制按钮，用户可手动 ⌘V），不做还原
     }
+
+    // 延迟还原：独立线程，不拖主线程
+    let text_marker = text.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        // 三重检查之一：代数已变 = 有人在我们之后写过剪贴板（用户点复制按钮 / 新一轮注入），放弃还原
+        if CLIPBOARD_GEN.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+            return;
+        }
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            // 三重检查之二：文本比对——只在剪贴板仍是我们写入的文本时还原
+            if let Ok(cur) = cb.get_text() {
+                if cur == text_marker {
+                    if let Some(b) = &backup {
+                        let _ = cb.set_text(b.clone());
+                        // 三重检查之三：还原本身也递增代数，通知后续可能的还原线程
+                        CLIPBOARD_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // 原剪贴板为空或非文本——留我们的文字作兜底（比清空好）
+                }
+            }
+        }
+    });
 
     InjectOutcome::Injected
 }
@@ -119,8 +152,10 @@ fn press_cmd_v() -> Result<(), String> {
     Ok(())
 }
 
-// 面板"复制"按钮的后盾：只写剪贴板，不碰键盘
+// 面板"复制"按钮的后盾：只写剪贴板，不碰键盘。
+// 递增代数以通知任何挂起的还原线程"用户显式写入了剪贴板，别还原"
 pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    CLIPBOARD_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     cb.set_text(text).map_err(|e| e.to_string())
 }
