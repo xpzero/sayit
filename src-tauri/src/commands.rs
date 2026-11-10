@@ -401,14 +401,23 @@ fn deliver(
                         }
                         return;
                     }
-                    // 确认输入态（或未授权走注入兜底）：照常注入
+                    // 确认输入态（或未授权走注入兜底）：**先发 result 面板即收，再做注入**——
+                    // 剪贴板备份/写入/⌘V/延迟还原不阻塞面板消失（用户反馈"消失很慢"，
+                    // 注入里的剪贴板读写是新增耗时）。乐观报 injected:true；万一注入失败
+                    // 文字仍在剪贴板 + 历史，面板已隐藏是可接受的取舍
+                    if !stale {
+                        let _ = app4.emit(
+                            "result",
+                            serde_json::json!({ "text": text, "injected": true, "reason": null }),
+                        );
+                    }
                     let outcome = if mode == "type" {
                         crate::inject::type_text(&text)
                     } else {
                         crate::inject::paste_text(&text)
                     };
-                    let (injected, reason) = match outcome {
-                        crate::inject::InjectOutcome::Injected => (true, None),
+                    match outcome {
+                        crate::inject::InjectOutcome::Injected => {}
                         crate::inject::InjectOutcome::NeedPermission => {
                             // 自动带路：系统不许可弹窗，但我们可以自动翻到正确的设置页
                             // （每次运行只自动开一次；翻开关那一下永远必须用户亲手+密码。
@@ -416,15 +425,11 @@ fn deliver(
                             if !stale && !system::AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
                                 let _ = system::open_accessibility_page(&app4);
                             }
-                            (false, Some("accessibility".to_string()))
+                            // 面板已隐藏，不再补发失败事件（文字在剪贴板+历史）
                         }
-                        crate::inject::InjectOutcome::Failed(e) => (false, Some(e)),
-                    };
-                    if !stale {
-                        let _ = app4.emit(
-                            "result",
-                            serde_json::json!({ "text": text, "injected": injected, "reason": reason }),
-                        );
+                        crate::inject::InjectOutcome::Failed(e) => {
+                            eprintln!("[inject] 注入失败（面板已收，文字在剪贴板+历史）：{e}");
+                        }
                     }
                 });
             });
