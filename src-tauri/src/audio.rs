@@ -166,7 +166,9 @@ pub fn start_with_cache(cache_path: Option<&Path>) -> Result<RecordingHandle, St
                     let first_nonzero_ms = first_nonzero_ms.clone();
                     move |data: &[f32], _| {
                         // 观测点：首回调 / 首非零（区分设备预热与用户开口反应，见 RecordingHandle 注释）
-                        let now_ms = opened_at.elapsed().as_millis() as u32;
+                        // max(1)：0 保留为"从未"哨兵——首回调若落在第 0 毫秒且带非零样本，
+                        // 存 0 会让死麦判定（MicDead 恒零检测）把健康麦误判成死麦（③审查 P1）
+                        let now_ms = (opened_at.elapsed().as_millis() as u32).max(1);
                         if first_cb_ms.load(Ordering::Relaxed) == 0 {
                             first_cb_ms.store(now_ms, Ordering::Relaxed);
                         }

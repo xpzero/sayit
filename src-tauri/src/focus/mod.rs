@@ -2,7 +2,7 @@ pub mod tty;
 
 // 输入焦点探测：交付时刻"光标处有没有文本框"的分层判定链。
 //
-// 链条：① AX（权威）→ ② 前台 App 黑名单 → ③ 通用终端判定（宿主 TTY）→ ④ Unknown。
+// 链条：① AX（权威）→ ② 通用终端判定（宿主 TTY）→ ③ Unknown（乐观注入）。
 // 注入契约（终稿 E，2026-11-10）：有输入态→注入；
 // 确认非输入态→按钮；Unknown→乐观注入（调用方 commands.rs deliver 执行，
 // 辅助功能未授权时例外放行走注入带路）。误判两个方向都可恢复：
@@ -13,7 +13,7 @@ pub mod tty;
 //   -25211 APIDisabled（辅助功能被拒）| -25212 NoValue（"该属性没有值"）
 // 历史勘误：早期记录把 -25212 当成 APIDisabled——真身是 NoValue，APIDisabled 是 -25211。
 // 故第一步"systemwide 查 AXFocusedApplication"承担通道体检：健康通道必有前台 App，
-// 出现 -25211/-25212 都按"通道不可用"处理（Unknown，走黑名单兜底）——绝不能把通道
+// 出现 -25211/-25212 都按"通道不可用"处理（Unknown，走终端判定兜底）——绝不能把通道
 // 错误当成"非输入态"；只有通道确认健康后，editable-ancestor 的 -25212 才是
 // "不可编辑"的合法回答（NoValue 语义）。
 //
@@ -25,7 +25,7 @@ pub mod tty;
 pub enum Verdict {
     /// 有可编辑焦点：放心注入
     Input,
-    /// 前台无文本框（AX 判定或黑名单命中）：跳过注入，结果位亮复制按钮
+    /// 前台无文本框（AX 判定）：跳过注入，结果位亮复制按钮
     NoInput,
     /// 判不出（通道不可用/目标忙/超时/AX 盲 App）：乐观注入（用户按键即意图），文字不丢在历史里
     /// （用户契约；唯一例外——辅助功能未授权时调用方放行走注入带路，见 commands.rs）
@@ -140,7 +140,7 @@ fn copy_attr(el: *const core::ffi::c_void, attr: &CfRef) -> (i32, *const core::f
 pub fn classify(app_err: i32, focus_err: Option<i32>, editable_err: Option<i32>, role: Option<&str>) -> Verdict {
     use Verdict::*;
     // 通道体检：健康通道必有前台 App。任何错误（含 -25212/-25211）都不下结论，
-    // 交给黑名单兜底——绝不能把通道故障冒充"非输入态"
+    // 交给终端判定兜底——绝不能把通道故障冒充"非输入态"
     if app_err != AX_SUCCESS {
         return Unknown;
     }
@@ -164,23 +164,10 @@ pub fn classify(app_err: i32, focus_err: Option<i32>, editable_err: Option<i32>,
     }
 }
 
-// ---------- App 名单兜底（只裁决 Unknown；AX 的 Input/NoInput 是权威，名单不改写） ----------
-
-/// 确定永远没有文本焦点的系统 App（AX 通道不可用时唯一能给的答案）。
-/// 取舍：Finder 的搜索/重命名框也会命中黑名单——手动 ⌘V 即可，文字不丢。
-const NO_INPUT_APPS: &[&str] = &[
-    "com.apple.finder",
-    "com.apple.dock",
-    "com.apple.systemuiserver",
-    "com.apple.wallpaper",
-];
-
-pub fn blacklist_hit(bundle_id: &str) -> bool {
-    NO_INPUT_APPS.iter().any(|b| bundle_id.eq_ignore_ascii_case(b))
-}
+// ---------- 终端判定兜底（只裁决 Unknown；AX 的 Input/NoInput 是权威，不改写） ----------
 
 pub fn probe(deadline: std::time::Duration) -> ProbeReport {
-    // 前台 App：名单/TTY 兜底的判据 + 观测点（排查"为什么没亮复制按钮"的第一现场）
+    // 前台 App：TTY 兜底的判据 + 观测点（排查"为什么没亮/亮了复制按钮"的第一现场）
     let frontmost = crate::inject::frontmost_app();
     let pid = frontmost.as_ref().map(|(_, p)| *p);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -196,7 +183,7 @@ pub fn probe(deadline: std::time::Duration) -> ProbeReport {
     };
     let report = if report.verdict == Verdict::Unknown {
         let tty_host = frontmost.as_ref().map(|(_, pid)| tty::hosts_tty(*pid)).unwrap_or(false);
-        with_app_lists(report, frontmost.as_ref().map(|(b, _)| b.as_str()), tty_host)
+        tty_fallback(report, tty_host)
     } else {
         report
     };
@@ -318,20 +305,15 @@ fn unknown(basis: &str) -> ProbeReport {
     ProbeReport { verdict: Verdict::Unknown, basis: basis.into() }
 }
 
-/// 名单/TTY 兜底：Unknown 时按前台 App 裁决——黑名单 → NoInput；宿主 TTY（终端类，
-/// 通用判定）→ Input；都不是 → 维持 Unknown（调用方按乐观注入处理）。
-/// 纯函数（TTY 判定结果由调用方算好传入），断言见 tests。
-fn with_app_lists(mut report: ProbeReport, frontmost: Option<&str>, tty_host: bool) -> ProbeReport {
-    if report.verdict == Verdict::Unknown {
-        if let Some(bid) = frontmost {
-            if blacklist_hit(bid) {
-                report.basis = format!("{}；前台黑名单命中 {bid}", report.basis);
-                report.verdict = Verdict::NoInput;
-            } else if tty_host {
-                report.basis = format!("{}；前台宿主命令行（终端判定）{bid}", report.basis);
-                report.verdict = Verdict::Input;
-            }
-        }
+/// TTY 兜底：Unknown 时按前台进程树裁决——宿主 TTY（终端类，键盘直达）→ Input；
+/// 其余维持 Unknown（调用方按乐观注入处理）。纯函数（TTY 判定结果由调用方算好
+/// 传入），断言见 tests。
+/// （黑名单层已移除 2026-11-10：唯一作用窗口是 AX 判不出+已授权+前台恰为系统 App，
+/// 收益不抵复杂度；NoInput 只由 AX 权威层产出。）
+fn tty_fallback(mut report: ProbeReport, tty_host: bool) -> ProbeReport {
+    if report.verdict == Verdict::Unknown && tty_host {
+        report.basis = format!("{}；前台宿主命令行（终端判定）", report.basis);
+        report.verdict = Verdict::Input;
     }
     report
 }
@@ -406,32 +388,17 @@ mod tests {
     }
 
     #[test]
-    fn 黑名单_覆盖已知无输入系统App_大小写不敏感() {
-        assert!(blacklist_hit("com.apple.finder"));
-        assert!(blacklist_hit("com.apple.dock"));
-        assert!(blacklist_hit("com.apple.wallpaper"));
-        assert!(blacklist_hit("COM.APPLE.SYSTEMUISERVER"));
-        assert!(!blacklist_hit("com.apple.TextEdit"));
-        assert!(!blacklist_hit("com.tencent.xinWeChat"));
-        assert!(!blacklist_hit(""));
-    }
-
-    #[test]
-    fn 名单裁决_黑名单降级_tty升级_只在unknown时生效() {
+    fn tty兜底_升级只在unknown时生效() {
         let r = |v: Verdict| ProbeReport { verdict: v, basis: "b".into() };
-        // 黑名单 → NoInput
-        assert_eq!(with_app_lists(r(Verdict::Unknown), Some("com.apple.finder"), false).verdict, Verdict::NoInput);
         // 宿主 TTY（终端通用判定）→ Input：wezterm 实测 AX 只报 AXWindow（Unknown），注入该照常
-        assert_eq!(with_app_lists(r(Verdict::Unknown), Some("com.github.wez.wezterm"), true).verdict, Verdict::Input);
-        // 无 TTY 且不在黑名单（如 AX 盲的 Electron 聊天 App）→ 维持 Unknown
-        assert_eq!(with_app_lists(r(Verdict::Unknown), Some("com.deepseek.dsh"), false).verdict, Verdict::Unknown);
-        assert_eq!(with_app_lists(r(Verdict::Unknown), None, true).verdict, Verdict::Unknown);
+        assert_eq!(tty_fallback(r(Verdict::Unknown), true).verdict, Verdict::Input);
+        // 无 TTY（如 AX 盲的 Electron 聊天 App，或前台是 Finder 等系统 App）→ 维持 Unknown（乐观注入）
+        assert_eq!(tty_fallback(r(Verdict::Unknown), false).verdict, Verdict::Unknown);
         // 已有判定不被改写（AX 的 Input/NoInput 是权威，兜底只补 Unknown 的窟窿）
-        assert_eq!(with_app_lists(r(Verdict::Input), Some("com.apple.finder"), true).verdict, Verdict::Input);
-        assert_eq!(with_app_lists(r(Verdict::NoInput), Some("com.github.wez.wezterm"), true).verdict, Verdict::NoInput);
+        assert_eq!(tty_fallback(r(Verdict::Input), true).verdict, Verdict::Input);
+        assert_eq!(tty_fallback(r(Verdict::NoInput), true).verdict, Verdict::NoInput);
         // 裁决依据写进 basis（观测点可查）
-        assert!(with_app_lists(r(Verdict::Unknown), Some("com.apple.finder"), false).basis.contains("黑名单命中"));
-        assert!(with_app_lists(r(Verdict::Unknown), Some("x"), true).basis.contains("宿主命令行"));
+        assert!(tty_fallback(r(Verdict::Unknown), true).basis.contains("宿主命令行"));
     }
 
 }

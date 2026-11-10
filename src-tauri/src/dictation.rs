@@ -53,6 +53,8 @@ pub enum Event {
     Signal,
     /// 开录判定 2s 兜底
     ArmTimeout,
+    /// 开录即测：宣布开录后 1s 恒零（全零假数据 = 权限被拒的麦）——早停直达静音结论
+    MicDead,
     /// 识别线程完成；携带它出发时的周期号
     SttDone { cycle: u64, outcome: SttOutcome },
 }
@@ -114,6 +116,22 @@ pub fn step(s: State, ev: &Event) -> (State, Vec<Effect>) {
             (State { phase: Transcribing, ..s }, vec![StopAndTranscribe { cycle: s.cycle }])
         }
         (Recording, Event::Abort) => (State { phase: Idle, ..s }, vec![DiscardStream, GoIdle]),
+        // 开录即测（2026-11-11）：宣布开录后 1s 窗口恒零（权限被拒的麦只送全零假数据）
+        // → 立即中止直达静音结论，不浪费用户说话。与"录音期间零打扰"的边界：零打扰
+        // 指不给"没声音"式催促；死麦是物理结论，越早说越好
+        (Recording, Event::MicDead) => (
+            State { phase: Idle, ..s },
+            vec![
+                DiscardStream,
+                Deliver {
+                    outcome: SttOutcome::Failed {
+                        error: "开录 1 秒内没采到任何声音——麦克风可能未授权或被系统静音".into(),
+                        reason: Some("silent_mic"),
+                    },
+                    cycle: s.cycle,
+                },
+            ],
+        ),
         (Recording, Event::Signal | Event::ArmTimeout) if !s.announced => {
             (State { announced: true, ..s }, vec![AnnounceRecording])
         }
@@ -205,6 +223,33 @@ mod tests {
         let (s2, e) = step(s, &Event::MicFailed("无法打开麦克风".into()));
         assert_eq!(s2.phase, Phase::Idle);
         assert_eq!(e, vec![Effect::FailOpen("无法打开麦克风".into())]);
+    }
+
+    #[test]
+    fn 开录即测_恒零早停_丢流并直达静音结论() {
+        let s = to_recording(true);
+        let (s2, e) = step(s, &Event::MicDead);
+        assert_eq!(s2.phase, Phase::Idle);
+        assert_eq!(e.len(), 2);
+        assert!(matches!(e[0], Effect::DiscardStream));
+        match &e[1] {
+            Effect::Deliver {
+                outcome: SttOutcome::Failed { reason: Some("silent_mic"), .. },
+                cycle: 1,
+            } => {}
+            other => panic!("非预期效果：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn micdead_仅录音相位有效_其余一律忽略() {
+        assert_eq!(step(idle(), &Event::MicDead).1, vec![Effect::Ignored]);
+        let (opening, _) = step(idle(), &Event::TogglePressed);
+        assert_eq!(step(opening, &Event::MicDead).1, vec![Effect::Ignored]);
+        let s = to_recording(true);
+        let (transcribing, _) = step(s, &Event::TogglePressed);
+        let (s2, e) = step(transcribing, &Event::MicDead);
+        assert_eq!((s2.phase, e), (Phase::Transcribing, vec![Effect::Ignored]));
     }
 
     #[test]

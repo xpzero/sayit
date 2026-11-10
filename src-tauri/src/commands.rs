@@ -6,7 +6,6 @@ use crate::hotkey;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use crate::panel;
-use crate::system;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
@@ -55,6 +54,10 @@ pub fn toggle_recording(app: AppHandle) {
 
 fn toggle_core(app: &AppHandle) {
     let cfg = config::load(app);
+    // 权限门（2026-11-10 B 案）：开新篇时拦下无权限的按键——逻辑、带路、节流全在 perm.rs
+    if crate::perm::blocked_on_toggle(app) {
+        return;
+    }
     // 前置检查：只在即将开新篇时（空闲/识别中）。本地识别却没有就绪模型 → 不录，直接带路。
     // 注意这一步不进状态机——它是配置问题，不是生命周期问题
     {
@@ -167,7 +170,7 @@ fn run_effects(
                 );
             }
             Effect::StopAndTranscribe { cycle } => stop_and_transcribe(app, cfg, cycle),
-            Effect::Deliver { outcome, cycle } => deliver(app, cfg, outcome, cycle),
+            Effect::Deliver { outcome, cycle } => crate::deliver::deliver(app, cfg, outcome, cycle),
             Effect::DropLateResult => println!("[stt] 迟到的识别结果已丢弃（周期已翻篇）"),
             Effect::FailOpen(e) => {
                 eprintln!("[toggle] 开麦失败（已重试一次）：{e}");
@@ -235,6 +238,7 @@ fn spawn_watch_thread(
         let started = std::time::Instant::now();
         let mut signal_sent = false;
         let mut timeout_sent = false;
+        let mut mic_dead_sent = false;
         while flag.load(Ordering::Relaxed) {
             let v = level.load(Ordering::Relaxed) as f32 / 1000.0;
             let _ = app3.emit("level", serde_json::json!({ "rms": v }));
@@ -258,6 +262,18 @@ fn spawn_watch_thread(
                 // "可以说话"；说话越线（Signal）仍会提前触发，谁先到谁宣布
                 timeout_sent = true;
                 send_event(&app3, crate::dictation::Event::ArmTimeout, None);
+            }
+            // 开录即测（2026-11-11）：1700ms = 宣布兜底（700ms）+1s 窗口。窗口内连一个
+            // 非零样本都没有（first_nonzero 由音频回调记录，0=从未）= 全零假数据——
+            // 权限被拒的麦只会送这个，立即早停（状态机 MicDead）。真麦再安静也有非零
+            // 底噪样本；已越线（Signal）则必然已有非零，条件自然不成立
+            if !mic_dead_sent
+                && started.elapsed() >= Duration::from_millis(1700)
+                && first_nonzero_ms.load(Ordering::Relaxed) == 0
+            {
+                mic_dead_sent = true;
+                println!("[mic-dead] 开录 1s 恒零：麦克风多半未授权/被占用，早停");
+                send_event(&app3, crate::dictation::Event::MicDead, None);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -345,105 +361,9 @@ fn stop_and_transcribe(app: &AppHandle, cfg: &config::Config, cycle: u64) {
 }
 
 // 状态机当前的周期号（deliver 的迟到守卫用；锁不可用时回 0 = 必然抑制，宁可少显示）
-fn flow_cycle(app: &AppHandle) -> u64 {
-    use tauri::Manager;
-    let state = app.state::<crate::state::SharedState>();
-    state.lock().map(|s| s.flow.cycle).unwrap_or(0)
-}
 
 // 效果：交付结果。焦点探测放独立线程（AX 是同步 XPC，目标 App 卡死不能拖住交付），
 // 判定拿回后再回主线程注入（enigo→HIToolbox 是 main-thread-only）；失败进结果位。
-// 迟到守卫：cycle0 取自状态机接受 SttDone 的时刻（Effect::Deliver 携带，唯一正确采样
-// 点——deliver 入口再读会落进"锁释放→读"的缝隙）；stale 在主线程闭包内复读——热键
-// 处理与该闭包同走主线程队列、彼此串行，复读值闭包执行期间不会再变。迟到的面板信号
-// 会砸掉新现场（injected=true 直接收起录音中的面板），注入与剪贴板则照常（文字必交付）。
-fn deliver(
-    app: &AppHandle,
-    cfg: &config::Config,
-    outcome: crate::dictation::SttOutcome,
-    cycle0: u64,
-) {
-    match outcome {
-        crate::dictation::SttOutcome::Text(text) => {
-            let mode = cfg.injection.mode.clone();
-            let app3 = app.clone();
-            // 记入历史（注入与否都记）——"文字不丢"的兜底：设置→历史，逐条显式复制
-            crate::history::record_history(app, &text);
-            std::thread::spawn(move || {
-                let report = crate::focus::probe(Duration::from_millis(300));
-                if report.verdict == crate::focus::Verdict::NoInput {
-                    println!("[focus] 非输入态，跳过注入（{}）", report.basis);
-                }
-                let app4 = app3.clone();
-                let _ = app3.run_on_main_thread(move || {
-                    let stale = flow_cycle(&app4) != cycle0;
-                    if stale {
-                        println!("[focus] 交付迟到（周期已翻篇）：抑制面板事件，注入照常");
-                    }
-                    // 注入契约（2026-11-10 终稿 E + 剪贴板最小侵入）：确认非输入态
-                    // （黑名单/AX 判定）才跳过注入并亮复制按钮——此时**不写剪贴板**
-                    // （用户剪贴板里可能是自己的内容，不能霸占）；文字不丢由听写历史
-                    // 保证（设置→历史，逐条显式复制），复制按钮点击时才写剪贴板。
-                    // 判不出（AX 盲 App）照常注入：用户在此按键本身就是意图声明。
-                    // 例外：辅助功能未授权时放行走注入路径——产出 NeedPermission 并自动带路
-                    if report.verdict == crate::focus::Verdict::NoInput
-                        && crate::inject::accessibility_ok()
-                    {
-                        if !stale {
-                            let _ = app4.emit(
-                                "result",
-                                serde_json::json!({
-                                    "text": text,
-                                    "injected": false,
-                                    "reason": "no_input_focus"
-                                }),
-                            );
-                        }
-                        return;
-                    }
-                    // 确认输入态（或未授权走注入兜底）：**先发 result 面板即收，再做注入**——
-                    // 剪贴板备份/写入/⌘V/延迟还原不阻塞面板消失（用户反馈"消失很慢"，
-                    // 注入里的剪贴板读写是新增耗时）。乐观报 injected:true；万一注入失败
-                    // 文字仍在剪贴板 + 历史，面板已隐藏是可接受的取舍
-                    if !stale {
-                        let _ = app4.emit(
-                            "result",
-                            serde_json::json!({ "text": text, "injected": true, "reason": null }),
-                        );
-                    }
-                    let outcome = if mode == "type" {
-                        crate::inject::type_text(&text)
-                    } else {
-                        crate::inject::paste_text(&text)
-                    };
-                    match outcome {
-                        crate::inject::InjectOutcome::Injected => {}
-                        crate::inject::InjectOutcome::NeedPermission => {
-                            // 自动带路：系统不许可弹窗，但我们可以自动翻到正确的设置页
-                            // （每次运行只自动开一次；翻开关那一下永远必须用户亲手+密码。
-                            // 迟到交付不弹——别在新一轮录音中途抢焦点开设置页）
-                            if !stale && !system::AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
-                                let _ = system::open_accessibility_page(&app4);
-                            }
-                            // 面板已隐藏，不再补发失败事件（文字在剪贴板+历史）
-                        }
-                        crate::inject::InjectOutcome::Failed(e) => {
-                            eprintln!("[inject] 注入失败（面板已收，文字在剪贴板+历史）：{e}");
-                        }
-                    }
-                });
-            });
-        }
-        crate::dictation::SttOutcome::Failed { error, reason } => {
-            let _ = app.emit(
-                "result",
-                serde_json::json!({ "error": error, "reason": reason }),
-            );
-        }
-    }
-}
-
-
 // 效果：丢弃在装流（录音中被 Esc）。随事件附带的"迟到流"不进这里——
 // 它从未采样，send_event 的收尾直接丢弃即可；这里只处理已采样的流：写盘即删（与旧实现一致）
 fn discard_stream(app: &AppHandle, state: &State<'_, crate::state::SharedState>) {
@@ -454,7 +374,7 @@ fn discard_stream(app: &AppHandle, state: &State<'_, crate::state::SharedState>)
         s.recording.take()
     };
     if let Some(handle) = handle {
-        println!("[toggle] 录音中止（Esc）");
+        println!("[toggle] 流已丢弃（Esc 中止 / 死麦早停 / 迟到流）");
         if let Ok(dir) = app.path().app_data_dir().map(|d| d.join("recordings")) {
             if let Ok((wav, _s, _n, _p)) = handle.stop(&dir) {
                 let _ = std::fs::remove_file(&wav); // 半句话没说完，音频直接丢弃

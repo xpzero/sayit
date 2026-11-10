@@ -1,6 +1,7 @@
 // 应用入口：注册插件、托盘、命令、全局状态——把各模块组装成完整应用
 mod audio;
 mod commands;
+mod deliver;
 mod config;
 mod dictation;
 mod engines;
@@ -10,6 +11,7 @@ mod hotkey;
 mod inject;
 mod models;
 mod panel;
+mod perm;
 mod state;
 mod stt;
 mod system;
@@ -48,6 +50,27 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // 崩溃取证：panic 的位置与消息落盘（.ips 只给汇编栈不给 panic 消息；
+            // dev 终端可能已滚走。2026-11-10 启动崩溃事后补的观测点）
+            {
+                let default_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/sayit-panic.log")
+                    {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let _ = writeln!(f, "[{ts}] {info}");
+                    }
+                    default_hook(info);
+                }));
+            }
+
             // 托盘应用形态：不在 Dock 显示图标
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

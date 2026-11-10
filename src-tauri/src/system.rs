@@ -101,6 +101,10 @@ pub fn open_accessibility_page(app: &AppHandle) -> Result<(), String> {
 pub(crate) static AUTO_OPENED_ACCESSIBILITY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// 权限门（perm.rs）的麦克风带路同款节流：每次运行只自动开一次麦克风设置页
+pub(crate) static AUTO_OPENED_MIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[tauri::command]
 pub fn open_keyboard_settings(app: AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;

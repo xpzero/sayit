@@ -113,9 +113,15 @@ pub fn library(app: &AppHandle) -> Vec<LibraryItem> {
 
     // 精选区：看磁盘上的实际文件状态
     for m in catalog() {
+        // 防御（2026-11-10 启动崩溃事后加固）：条目文件不足 2 个时跳过并留观测点，
+        // 绝不 panic——设置窗口启动即调本函数，这里一炸就是全应用死
+        let (Some(f_model), Some(f_mmproj)) = (m.files.first(), m.files.get(1)) else {
+            eprintln!("[models] 精选条目 {} 文件数 {}（需 2），跳过", m.id, m.files.len());
+            continue;
+        };
         let dir = model_dir(app, m.id);
-        let model_p = dir.join(&m.files[0].filename);
-        let mmproj_p = dir.join(&m.files[1].filename);
+        let model_p = dir.join(&f_model.filename);
+        let mmproj_p = dir.join(&f_mmproj.filename);
         let m_ok = is_gguf(&model_p);
         let w_ok = is_gguf(&mmproj_p);
         let status = match (m_ok, w_ok) {

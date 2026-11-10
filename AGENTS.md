@@ -101,7 +101,7 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   dev 侧 TCC 授权的真实修复 = **固定签名身份**（`src-tauri/scripts/dev-runner.sh` + 钥匙串身份
   「Sayit Dev」，DR 锚定证书根哈希，跨编译存活；2026-11-09 实测 tauri dev 自动重启后 AX 通道
   `app=0` 稳定存活）。`focus.rs` 链式分类：focusedApplication 层任何错误（含 -25212）一律
-  Unknown 走黑名单，绝不冒充"非输入态"；AX 盲 App 上非输入态原理上不可知（这信息只有 AX 有），
+  Unknown 走终端判定/乐观注入，绝不冒充"非输入态"；AX 盲 App 上非输入态原理上不可知（这信息只有 AX 有），
   唯一安全解 = 照常注入 + 剪贴板兜底。
 - EDIFIER Fit900NB（USB 声卡）：StartIO 成功后 **~0.5s 才送真信号**，期间回调缺席或送全零；
   偶发驱动级 StartIO 拒绝（错误码 'what'），亚秒内自愈，开麦失败自动重试一次即可覆盖。
@@ -130,14 +130,19 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   代数计数器 + 文本比对双重防护：复制按钮/下一轮注入写过剪贴板则放弃还原）。
   限制：仅还原纯文本；图片/富文本不还原（我们的文字留作兜底）。
   文字不丢由**听写历史**保证（设置→历史，最近 100 条本地持久化，逐条显式复制）。
-- **录音期间零打扰**：不说"没声音"式提示；死麦结论只在停止时刻给（`silent_mic` 结果位 + 直达设置按钮）。
+- **录音期间零打扰**：不说"没声音"式提示。死麦结论 2026-11-11 从"停止时刻给"提前到
+  "开录即测"：宣布开录后 1s 恒零（权限被拒的麦只送全零假数据，dev 形态归责宿主终端、
+  authorizationStatus 看不见，TCC 日志实测）即早停直达 `silent_mic` 结果位 + 设置按钮
+  （[mic-dead] 观测点）；安静但活着的麦不受影响（真麦有非零底噪，first_nonzero 见证）。
+  死麦结论出现即自动带路开麦克风设置页（deliver Failed 分支，AUTO_OPENED_MIC 节流）。
 - **输入焦点探测走分层链（focus.rs）**：① AX 权威（focusedApplication → focusedUIElement →
-  editableAncestor，通道级错误一律 Unknown 不冒充判定）→ ② 前台 App 黑名单（Finder/Dock/
-  SystemUIServer/Wallpaper，NSWorkspace 无需权限）→ ③ 通用终端判定（前台 App 进程树宿主
+  editableAncestor，通道级错误一律 Unknown 不冒充判定）→ ② 通用终端判定（前台 App 进程树宿主
   TTY = 键盘直达，任何终端模拟器天然满足，与名字无关；附带命中带集成终端的 IDE——注入
-  通常正是想要的）→ ④ Unknown。
+  通常正是想要的）→ ③ Unknown。（黑名单层 2026-11-10 移除：唯一作用窗口是 AX 判不出+
+  已授权+前台恰为 Finder/Dock 等系统 App，把静默空打换成亮复制按钮——收益不抵复杂度，
+  NoInput 只由 AX 权威层产出。）
   **注入判据（2026-11-10 终稿 E）**：**逐状态精确判定**——有输入态（AX 判定/终端判定）→ 注入；
-  确认非输入态（黑名单/AX 判定 NoInput）→ 跳过注入亮复制按钮。判不出（Unknown）照常注入：
+  确认非输入态（AX 判定 NoInput）→ 跳过注入亮复制按钮。判不出（Unknown）照常注入：
   用户在此按键本身就是意图声明，落空兜底在听写历史里逐条取回。**Electron/Chromium 的 AX 唤醒**：
   探测全灭时设 AXManualAccessibility（Electron 认）
   与 AXEnhancedUserInterface（Chrome 认）为 true——官方记载的第三方机制，树异步建起后这些 App
@@ -148,6 +153,13 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   注入成功即收起面板（零打扰：复制按钮只出现在"没注入进去"的现场）。
   取证仪器：/tmp/sayit-focus.log（每次听写一行判定/AX 错误码/前台 App）。
   AX 通道在 dev 的可用性依赖固定签名身份（见上「AX 探测死亡陷阱」勘误与 dev-runner.sh）。
+- **权限门（2026-11-10 B 案）**：开新篇的按键实时查两项（TCC 缓存读，微秒级，授权后无需
+  重启）——麦克风明确拒绝/受限（AVCaptureDevice authorizationStatus，"未询问"必须放行：系统
+  弹窗只在首次开麦出现，拦了就死锁）或辅助功能未开（AXIsProcessTrusted）→ 按键失效：不进
+  状态机、面板不出现；每次运行首次被拦自动带路开对应设置页（system.rs 节流开关）。
+  录音中/开麦中的按键永不拦（防卡录音态）；查询失败按放行（fail-open），误放行由死麦判定/
+  注入 NeedPermission 兜底。观测点：[perm-gate]。门体在 perm.rs（纯核心 gate_decision
+  /mic_status_allowed 断言在 tests）。
 - **开麦流程**：先见面板（加载态）→ 后台开麦（失败自动重试一次）→ 声纹亮起 = **时间基准**
   （开流后 700ms；三拍实测 2026-11-10：设备预热 435–570ms，见 /tmp/sayit-mic.log 三拍日志），
   真信号（说话越线）仍会提前触发，谁先到谁宣布。原"等真信号 + 2s 兜底"实测造成等待死锁：
