@@ -142,8 +142,10 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   已授权+前台恰为 Finder/Dock 等系统 App，把静默空打换成亮复制按钮——收益不抵复杂度，
   NoInput 只由 AX 权威层产出。）
   **注入判据（2026-11-10 终稿 E）**：**逐状态精确判定**——有输入态（AX 判定/终端判定）→ 注入；
-  确认非输入态（AX 判定 NoInput）→ 跳过注入亮复制按钮。判不出（Unknown）照常注入：
-  用户在此按键本身就是意图声明，落空兜底在听写历史里逐条取回。**Electron/Chromium 的 AX 唤醒**：
+  确认非输入态（AX 判定 NoInput）→ 跳过注入亮复制按钮。判不出（Unknown，终端判定也未
+  救回）→ 同样跳过注入，亮"不确定光标处"复制按钮（2026-11-11 增补，重启当年"Unknown
+  走按钮"否决案——依据已变：终端有 TTY 兜底、Electron 靠 AX 唤醒只盲首轮，ZCode 等
+  只首撞一次按钮）；落空兜底在听写历史里逐条取回。**Electron/Chromium 的 AX 唤醒**：
   探测全灭时设 AXManualAccessibility（Electron 认）
   与 AXEnhancedUserInterface（Chrome 认）为 true——官方记载的第三方机制，树异步建起后这些 App
   即可逐状态判定；建树期（首轮）由乐观注入覆盖。曾否决过"Unknown 不注入走按钮"与"按应用规则"，

@@ -173,6 +173,7 @@ describe("相位视图与徽标映射（纯函数）", () => {
     // 后端 deliver 产出的两个非错误 reason（commands.rs）逐一有专属键
     expect(badgeKeyOf({ injected: false, reason: "accessibility" })).toBe("accessibility");
     expect(badgeKeyOf({ injected: false, reason: "no_input_focus" })).toBe("no_input_focus");
+  expect(badgeKeyOf({ injected: false, reason: "unsure_focus" })).toBe("unsure_focus");
     // 未知/缺失 reason 才落默认徽标
     expect(badgeKeyOf({ injected: false, reason: null })).toBe("miss");
     expect(badgeKeyOf({ injected: false, reason: "clipboard_failed" })).toBe("miss"); // 已删的旧 reason

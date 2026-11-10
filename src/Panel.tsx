@@ -229,6 +229,9 @@ export default function Panel() {
             {badge === "no_input_focus" && (
               <span className="injected-badge miss">没在输入框 · 点复制取回（历史在设置）</span>
             )}
+            {badge === "unsure_focus" && (
+              <span className="injected-badge miss">不确定光标处 · 点复制取回（历史在设置）</span>
+            )}
             {badge === "miss" && <span className="injected-badge miss">未自动插入 · 点复制取回（历史在设置）</span>}
             <button
               className="pill-btn"

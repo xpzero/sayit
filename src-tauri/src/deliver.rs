@@ -30,8 +30,8 @@ pub fn deliver(
             crate::history::record_history(app, &text);
             std::thread::spawn(move || {
                 let report = crate::focus::probe(Duration::from_millis(300));
-                if report.verdict == crate::focus::Verdict::NoInput {
-                    println!("[focus] 非输入态，跳过注入（{}）", report.basis);
+                if report.verdict != crate::focus::Verdict::Input {
+                    println!("[focus] 无输入判定（{:?}）：{}", report.verdict, report.basis);
                 }
                 let app4 = app3.clone();
                 let _ = app3.run_on_main_thread(move || {
@@ -39,22 +39,24 @@ pub fn deliver(
                     if stale {
                         println!("[focus] 交付迟到（周期已翻篇）：抑制面板事件，注入照常");
                     }
-                    // 注入契约（2026-11-10 终稿 E + 剪贴板最小侵入；黑名单层
-                    // 已移除同日）：确认非输入态（AX 判定）才跳过注入并亮复制按钮——此时**不写剪贴板**
-                    // （用户剪贴板里可能是自己的内容，不能霸占）；文字不丢由听写历史
-                    // 保证（设置→历史，逐条显式复制），复制按钮点击时才写剪贴板。
-                    // 判不出（AX 盲 App）照常注入：用户在此按键本身就是意图声明。
+                    // 注入契约（终稿 E；2026-11-11 增补：Unknown∧无 TTY 也走按钮）：
+                    // Input（AX/TTY 判出）→ 注入；NoInput（AX 权威）→ 按钮；Unknown（TTY
+                    // 也没救回，如系统设置等只报 AXWindow 的应用）→ 按钮不注入——注入大概率
+                    // 空打，亮按钮是诚实反馈。当年"Unknown 不注入走按钮"因 ZCode 永久盲被否，
+                    // 现依据已变：终端有 TTY 兜底、Electron 靠 AX 唤醒只盲首轮，重启此案。
+                    // 按钮**不写剪贴板**（剪贴板最小侵入）；文字不丢由听写历史保证。
                     // 例外：辅助功能未授权时放行走注入路径——产出 NeedPermission 并自动带路
-                    if report.verdict == crate::focus::Verdict::NoInput
-                        && crate::inject::accessibility_ok()
+                    if let Some(reason) =
+                        skip_inject_reason(report.verdict, crate::inject::accessibility_ok())
                     {
+                        println!("[focus] 跳过注入（{:?}）：{}", report.verdict, report.basis);
                         if !stale {
                             let _ = app4.emit(
                                 "result",
                                 serde_json::json!({
                                     "text": text,
                                     "injected": false,
-                                    "reason": "no_input_focus"
+                                    "reason": reason
                                 }),
                             );
                         }
@@ -117,3 +119,35 @@ pub fn deliver(
 }
 
 
+
+/// 纯核心：跳过注入的判据与徽标 reason（断言见 mod tests）。
+/// Input → 注入；NoInput → no_input_focus；Unknown（TTY 未救回，probe 内已裁决）→
+/// unsure_focus。辅助功能未授权 → 一律 None（放行走注入路径产出 NeedPermission 带路）
+fn skip_inject_reason(verdict: crate::focus::Verdict, ax_ok: bool) -> Option<&'static str> {
+    use crate::focus::Verdict;
+    if !ax_ok {
+        return None;
+    }
+    match verdict {
+        Verdict::Input => None,
+        Verdict::NoInput => Some("no_input_focus"),
+        Verdict::Unknown => Some("unsure_focus"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::focus::Verdict;
+
+    #[test]
+    fn 跳过注入_三值判定与未授权例外() {
+        assert_eq!(skip_inject_reason(Verdict::Input, true), None);
+        assert_eq!(skip_inject_reason(Verdict::NoInput, true), Some("no_input_focus"));
+        // Unknown∧无 TTY（TTY 已在 probe 内参与，Unknown 即未救回）→ 按钮
+        assert_eq!(skip_inject_reason(Verdict::Unknown, true), Some("unsure_focus"));
+        // 未授权例外：放行走注入路径带路（NeedPermission）
+        assert_eq!(skip_inject_reason(Verdict::Unknown, false), None);
+        assert_eq!(skip_inject_reason(Verdict::NoInput, false), None);
+    }
+}
