@@ -619,27 +619,32 @@ canvas.wave {
   height: 44px;
   display: block;
 }
-/* 听写期固定布局：声纹 + 状态灯同排共存（相位只改属性：灯色/文字，结构不变） */
+/* 听写期横排布局：声纹条 + 麦克风图标 + 状态文字 */
 .live-row {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.live-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--line-2);
-  animation: pill-pulse 1.1s ease-in-out infinite; /* 纯 opacity 呼吸：最安全的动画 */
+/* 麦克风图标：颜色 + 呼吸频率随相位变化，图标本身即状态指示器 */
+.live-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: color 0.3s ease;
+  animation: pill-pulse 1.1s ease-in-out infinite;
 }
-.live-dot.warm {
-  background: #d9a441; /* 唤醒中：琥珀 */
+.live-icon.warm {
+  color: #aaa; /* 唤醒中：灰 */
+  animation-duration: 1.4s;
 }
-.live-dot.live {
-  background: var(--seal); /* 录音中：朱砂 */
+.live-icon.live {
+  color: var(--seal); /* 录音中：朱砂 */
+  animation-duration: 1.2s;
 }
-.live-dot.busy {
-  background: #8a93a3; /* 识别中：青灰 */
+.live-icon.busy {
+  color: #8a93a3; /* 识别中：青灰 */
+  animation-duration: 0.7s; /* 快闪 = 正在处理 */
 }
 .live-label {
   font-size: 11.5px;

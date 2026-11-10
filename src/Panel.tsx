@@ -121,6 +121,9 @@ export default function Panel() {
     let raf = 0;
     let t = 0;
     let last = performance.now();
+    // 点火冲量（waveActive false→true 瞬间的 400ms 增益加成）
+    let igniteAt = 0;
+    let wasActive = false;
 
     const tick = (now: number) => {
       const dt = Math.min(0.06, (now - last) / 1000);
@@ -129,12 +132,22 @@ export default function Panel() {
       const W = cv.width;
       const H = cv.height;
       ctx.clearRect(0, 0, W, H);
-      // 峰值缓慢衰减（≈每秒 ×0.74），停话后增益自动回落；对滚动峰值归一化，多小的麦都撑满
+
+      const isRec = waveActiveRef.current;
+      if (isRec && !wasActive) igniteAt = now;
+      wasActive = isRec;
+
+      // 点火增益：400ms 内从 ~2 衰减到 1（条形从底部弹射过冲）
+      let boost = 1;
+      if (isRec && igniteAt > 0) {
+        const e = now - igniteAt;
+        if (e < 400) boost = 1 + 1.0 * Math.exp(-3.5 * (e / 400)) * Math.cos((e / 400) * Math.PI * 2.5);
+      }
+
+      // AGC
       peakRef.current = Math.max(peakRef.current * 0.995, ampRef.current, 0.005);
       // 非录音相位（唤醒/识别）目标音量为 0：声纹平滑落底，视觉语义 = 没在收声
-      const amp = waveActiveRef.current
-        ? clamp01((ampRef.current / peakRef.current) * 0.85)
-        : 0;
+      const amp = isRec ? clamp01((ampRef.current / peakRef.current) * 0.85) : 0;
       const gap = 4;
       const bw = 7; // 2x 画布：屏上 3.5px 条宽
       const total = BARS * bw + (BARS - 1) * gap;
@@ -144,7 +157,7 @@ export default function Panel() {
         const b = bars[k];
         const env = 0.45 + 0.55 * Math.sin((Math.PI * (k + 0.5)) / BARS); // 中间高两侧低
         const wig = 0.5 + 0.5 * Math.sin(t * b.sp + b.ph);
-        const target = clamp01(amp * (0.25 + 0.75 * env * (0.45 + 0.55 * wig)));
+        const target = clamp01(amp * boost * (0.25 + 0.75 * env * (0.45 + 0.55 * wig)));
         b.cur += (target - b.cur) * Math.min(1, dt * 14); // 平滑起落
         const h = Math.max(2.4, b.cur * H * 0.86);
         const x = x0 + k * (bw + gap);
@@ -166,10 +179,17 @@ export default function Panel() {
   const badge = state.kind === "result" && !state.error ? badgeKeyOf(state) : null;
 
   // 内容区：听写期 = 固定布局（声纹 + 状态灯同屏共存）；结果态是唯一一次内容替换
+  // 暖机态（非录音中）：声纹条几乎不可见——"看到暗的=还不能说话"是强视觉信号
   const content = live ? (
     <div className="live-row">
       <canvas ref={canvasRef} className="wave" width={352} height={88} aria-label="录音声纹" />
-      <span className={`live-dot ${lamp.dot}`} aria-label={lamp.label} />
+      <span className={`live-icon ${lamp.dot}`} aria-label={lamp.label}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <rect x="9" y="2" width="6" height="12" rx="3" />
+          <path d="M5 10v1a7 7 0 0 0 14 0v-1" />
+          <path d="M12 18v4" />
+        </svg>
+      </span>
       <span className="live-label">{lamp.label}</span>
     </div>
   ) : state.kind === "result" ? (
