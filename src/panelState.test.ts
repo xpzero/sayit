@@ -170,13 +170,12 @@ describe("相位视图与徽标映射（纯函数）", () => {
   it("badgeKeyOf：后端每个 reason 都有专属徽标，不落默认", () => {
     expect(badgeKeyOf({ injected: true })).toBe("injected");
     expect(badgeKeyOf({ injected: true, reason: "no_input_focus" })).toBe("injected"); // 注入成功优先
-    // 后端 deliver 产出的四个非错误 reason（commands.rs）逐一有专属键
+    // 后端 deliver 产出的两个非错误 reason（commands.rs）逐一有专属键
     expect(badgeKeyOf({ injected: false, reason: "accessibility" })).toBe("accessibility");
-    expect(badgeKeyOf({ injected: false, reason: "clipboard_failed" })).toBe("clipboard_failed");
     expect(badgeKeyOf({ injected: false, reason: "no_input_focus" })).toBe("no_input_focus");
-    expect(badgeKeyOf({ injected: false, reason: "focus_unknown" })).toBe("focus_unknown");
     // 未知/缺失 reason 才落默认徽标
     expect(badgeKeyOf({ injected: false, reason: null })).toBe("miss");
+    expect(badgeKeyOf({ injected: false, reason: "clipboard_failed" })).toBe("miss"); // 已删的旧 reason
     expect(badgeKeyOf({ injected: false, reason: "whatever" })).toBe("miss");
     expect(badgeKeyOf({})).toBe("miss");
   });

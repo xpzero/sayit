@@ -260,3 +260,15 @@ mod tests {
         assert!(!seen.contains(&0), "键码 0（幽灵）不得入表");
     }
 }
+
+// ---------- 快捷键捕获命令（设置页录制框的开关） ----------
+#[tauri::command]
+pub fn start_hotkey_capture() {
+    crate::hotkey::tap::start_capture();
+}
+
+#[tauri::command]
+pub fn stop_hotkey_capture() {
+    crate::hotkey::tap::stop_capture();
+}
+

@@ -1,6 +1,7 @@
 // 文字注入模块：把识别文字送进"当前光标所在的应用"
-// 主方案 = 写剪贴板 + 模拟 Cmd+V（结果常驻剪贴板，不备份/还原——见 paste_text 内注释）
-// 备选   = 直接键入：合成携带 Unicode 文本的输入事件（剪贴板里也留一份兜底）
+// 主方案 = 写剪贴板 + 模拟 Cmd+V（唯一允许写剪贴板的路径之一——⌘V 的机制要求；
+// 剪贴板最小侵入政策见 AGENTS.md：非注入路径不写、复制按钮点击才写）
+// 备选   = 直接键入：合成携带 Unicode 文本的输入事件（落空兜底走听写历史）
 //
 // 历史教训（2026-11-09 实测）：dev 二进制重编译后 TCC 授权与代码签名失配，
 // AXIsProcessTrusted() 谎报 true 而 AX 查询失败——事件注入（enigo→CGEventPost）走另一
@@ -73,14 +74,11 @@ pub fn paste_text(text: &str) -> InjectOutcome {
         Err(e) => return InjectOutcome::Failed(format!("打不开剪贴板：{e}")),
     };
 
-    // 识别结果常驻剪贴板，不做备份/还原。三个理由：
-    // 1) Cmd+V 落不进任何输入框时（焦点在桌面等），文本仍在剪贴板——点进输入框按
-    //    ⌘V 即可，任何情况下文字都不会丢；
-    // 2) 备份/还原有先天竞态：还原太早，目标应用（网页/Electron 的慢事件循环）还没
+    // paste 模式写剪贴板 = ⌘V 的机制要求，写入后不还原：
+    // 1) 备份/还原有先天竞态：还原太早，目标应用（网页/Electron 的慢事件循环）还没
     //    读剪贴板，用户粘到的反而是"旧内容"——实测踩坑；
-    // 3) 焦点探测判 NoInput/Unknown 时根本走不到这里（deliver 提前回退到复制按钮）；
-    //    能走到 = 确认输入态或未授权例外，注入落空的风险由剪贴板常驻兜底。
-    // 代价：每次听写覆盖剪贴板。对听写工具而言"最后一次结果随手可粘"本就是合理语义。
+    // 2) 注入落空（罕见：确认输入态后焦点瞬移）时文字恰好在剪贴板，⌘V 可取。
+    // 代价：注入这一次覆盖剪贴板——机械制要求，剪贴板最小侵入政策下的唯一例外。
     if let Err(e) = cb.set_text(text.to_string()) {
         return InjectOutcome::Failed(format!("写剪贴板失败：{e}"));
     }
@@ -97,12 +95,8 @@ pub fn type_text(text: &str) -> InjectOutcome {
     if !accessibility_ok() {
         return InjectOutcome::NeedPermission;
     }
-    // 键入没有回执：事件没人消费（无文本焦点）时文字凭空消失。先在剪贴板留一份兜底，
-    // 与 paste 模式语义对齐——最后一次听写结果永远可以在剪贴板找到。
-    // 写失败必须留痕（面板承诺"文本在剪贴板"，不能无声说谎）
-    if let Err(e) = copy_to_clipboard(text) {
-        eprintln!("[inject] 键入模式写剪贴板兜底失败：{e}");
-    }
+    // 键入没有回执：事件没人消费（无文本焦点）时文字凭空消失——落空的兜底走
+    // 听写历史（设置→历史，逐条显式复制；剪贴板最小侵入：不再偷偷写）
     use enigo::{Enigo, Keyboard, Settings};
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,

@@ -1,5 +1,6 @@
 // 模型库与下载器（第 4 讲）：策展清单 + 五道工序（目标→流式落盘→校验→登记→广播）
 // 断点续传靠 HTTP Range：.part 文件存在就从它的长度接着下
+use crate::config;
 use serde::Serialize;
 use std::fs;
 use std::io::Write;
@@ -7,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------- 精选货架（链接已于 2026-11 经 hf-mirror 核实） ----------
 
@@ -354,3 +355,116 @@ fn short(p: &str) -> String {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| p.into())
 }
+
+// ---------- 模型库命令（由 commands.rs 并入其领域） ----------
+#[tauri::command]
+pub fn get_model_library(app: AppHandle) -> Vec<LibraryItem> {
+    library(&app)
+}
+
+#[tauri::command]
+pub fn download_model(app: AppHandle, state: State<'_, crate::state::SharedState>, id: String) {
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let s = state.lock().unwrap();
+        let mut dls = s.downloads.lock().unwrap();
+        // 同一个模型不重复开下
+        if dls.contains_key(&id) {
+            return;
+        }
+        dls.insert(id.clone(), flag.clone());
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // 点击立即有反馈：先播报"开始连接"，绝不无声无息
+        let _ = app.emit(
+            "download-progress",
+            serde_json::json!({ "id": id, "stage": "progress", "pct": 0, "note": "开始连接…" }),
+        );
+        // 防崩保护：线程内 panic 也要变成可见的错误事件
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            download(&app, &id, flag)
+        }));
+        match result {
+            Ok(Ok(())) => {} // download() 内部已广播 done/cancelled
+            Ok(Err(e)) => {
+                let _ = app.emit(
+                    "download-progress",
+                    serde_json::json!({ "id": id, "stage": "error", "message": e }),
+                );
+            }
+            Err(_) => {
+                let _ = app.emit(
+                    "download-progress",
+                    serde_json::json!({ "id": id, "stage": "error", "message": "下载线程内部异常，请重试" }),
+                );
+            }
+        }
+        // 收摊：无论成败都摘掉取消标记（否则点第二次会被"已在下载"挡住）
+        if let Some(state) = app.try_state::<crate::state::SharedState>() {
+            if let Ok(s) = state.lock() {
+                if let Ok(mut dls) = s.downloads.lock() {
+                    dls.remove(&id);
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn cancel_download(app: AppHandle, state: State<'_, crate::state::SharedState>, id: String) {
+    if let Ok(s) = state.lock() {
+        if let Ok(dls) = s.downloads.lock() {
+            if let Some(flag) = dls.get(&id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    let _ = app;
+}
+
+#[tauri::command]
+pub fn delete_model(app: AppHandle, id: String) -> Result<(), String> {
+    // 引擎可能正跑在这个模型上，先停掉
+    crate::stt::local::kill_engine(&app);
+    // 精选模型：删目录；自带模型：只从清单移除（文件是用户的，不动）
+    if catalog().iter().any(|m| m.id == id) {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("models")
+            .join(&id);
+        std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
+    } else {
+        let mut cfg = config::load(&app);
+        cfg.model_library.retain(|e| e.id != id);
+        if cfg.stt.local_model_id.as_deref() == Some(id.as_str()) {
+            cfg.stt.local_model_id = None;
+        }
+        config::save(&app, &cfg)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn add_user_model(app: AppHandle, paths: Vec<String>) -> Result<String, String> {
+    register_user_files(&app, &paths)
+}
+
+#[tauri::command]
+pub fn set_default_model(app: AppHandle, id: String) -> Result<(), String> {
+    // 只有"就绪"的模型才有资格当默认
+    let item = library(&app)
+        .into_iter()
+        .find(|m| m.id == id && m.status == "ready")
+        .ok_or("模型不存在或未就绪")?;
+    let mut cfg = config::load(&app);
+    if cfg.stt.local_model_id.as_deref() != Some(item.id.as_str()) {
+        crate::stt::local::kill_engine(&app); // 换默认模型 = 引擎要换血
+    }
+    cfg.stt.local_model_id = Some(item.id);
+    config::save(&app, &cfg)
+}
+

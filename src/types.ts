@@ -29,7 +29,11 @@ export interface ModelEntry {
 
 export interface Hotkeys {
   dictation: string[];
-  pasteLastResult: string[];
+}
+
+export interface HistoryEntry {
+  tsMs: number;
+  text: string;
 }
 
 export interface Injection {

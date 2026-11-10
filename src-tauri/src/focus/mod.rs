@@ -1,8 +1,10 @@
+pub mod tty;
+
 // 输入焦点探测：交付时刻"光标处有没有文本框"的分层判定链。
 //
 // 链条：① AX（权威）→ ② 前台 App 黑名单 → ③ 通用终端判定（宿主 TTY）→ ④ Unknown。
-// 注入契约（用户拍板 2026-11-09）：只有 Input（含终端判定）才注入；
-// NoInput/Unknown 一律不注入 + 复制按钮（调用方 commands.rs deliver 执行，
+// 注入契约（终稿 E，2026-11-10）：有输入态→注入；
+// 确认非输入态→按钮；Unknown→乐观注入（调用方 commands.rs deliver 执行，
 // 辅助功能未授权时例外放行走注入带路）。误判两个方向都可恢复：
 // 误拦 = 手动 ⌘V（文字在剪贴板）；误注入 = 落空（文字同样在剪贴板 + 复制按钮）。
 //
@@ -25,7 +27,7 @@ pub enum Verdict {
     Input,
     /// 前台无文本框（AX 判定或黑名单命中）：跳过注入，结果位亮复制按钮
     NoInput,
-    /// 判不出（通道不可用/目标忙/超时/AX 盲 App）：不注入、文本进剪贴板 + 复制按钮
+    /// 判不出（通道不可用/目标忙/超时/AX 盲 App）：乐观注入（用户按键即意图），文字不丢在历史里
     /// （用户契约；唯一例外——辅助功能未授权时调用方放行走注入带路，见 commands.rs）
     Unknown,
 }
@@ -37,7 +39,10 @@ pub struct ProbeReport {
     pub basis: String,
 }
 
-// ---------- FFI（ApplicationServices / CoreFoundation，与 inject.rs 同款裸声明） ----------
+// ---------- AX 访问层：手写 FFI ----------
+// 曾评估换 axuielement crate（2026-11-10）：0.8+ 全系带 Swift 桥，在仅 CommandLineTools
+// （无完整 Xcode）的机器上链接失败（swiftCompatibility56 符号未定义）——整套开发环境
+// 都会踩，弃用。手写 FFI 经三轮独立审查，读路径 + 唤醒全在此。
 
 const AX_SUCCESS: i32 = 0;
 const AX_NO_VALUE: i32 = -25212;
@@ -47,10 +52,17 @@ const K_CFSTRING_ENCODING_UTF8: u32 = 0x0800_0100;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXUIElementCreateSystemWide() -> *const core::ffi::c_void;
+    fn AXUIElementCreateApplication(pid: i32) -> *const core::ffi::c_void;
     fn AXUIElementCopyAttributeValue(
         element: *const core::ffi::c_void,
         attribute: *const core::ffi::c_void, // CFStringRef
         value: *mut *const core::ffi::c_void, // CFTypeRef*（CF_RETURNS_RETAINED）
+    ) -> i32;
+    // 唤醒路径专用：设 AXManualAccessibility / AXEnhancedUserInterface
+    fn AXUIElementSetAttributeValue(
+        element: *const core::ffi::c_void,
+        attribute: *const core::ffi::c_void,
+        value: *const core::ffi::c_void,
     ) -> i32;
     // CoreFoundation（ApplicationServices 是伞形框架，CoreFoundation 随之可用）
     fn CFStringCreateWithCString(
@@ -67,6 +79,7 @@ unsafe extern "C" {
         encoding: u32,
     ) -> bool;
     fn CFRelease(cf: *const core::ffi::c_void);
+    static kCFBooleanTrue: *const core::ffi::c_void;
 }
 
 /// RAII 持有 CoreFoundation 对象（Create/Copy 规则：调用方负责释放）
@@ -109,6 +122,12 @@ fn cf_to_string(cf: &CfRef) -> Option<String> {
             None
         }
     }
+}
+
+fn copy_attr(el: *const core::ffi::c_void, attr: &CfRef) -> (i32, *const core::ffi::c_void) {
+    let mut v: *const core::ffi::c_void = std::ptr::null();
+    let err = unsafe { AXUIElementCopyAttributeValue(el, attr.0, &mut v) };
+    (err, v)
 }
 
 // ---------- 判定核心（纯函数，语义全部固化在 mod tests） ----------
@@ -160,70 +179,13 @@ pub fn blacklist_hit(bundle_id: &str) -> bool {
     NO_INPUT_APPS.iter().any(|b| bundle_id.eq_ignore_ascii_case(b))
 }
 
-// ---------- 通用终端判定：前台 App 的进程树宿主 TTY ----------
-//
-// 终端模拟器的定义性特征不是名字，而是"进程树里挂着带控制终端的 shell"——
-// Terminal/iTerm2/wezterm/kitty/Warp……全满足，无需枚举名单（实测 wezterm 的 AX
-// 只报 AXWindow，探不出输入框，但 ⌘V/键入必然落进终端）。附带效应：带集成终端的
-// IDE（VS Code 等）同样命中——对它们注入通常正是想要的（编辑器接受键入）。
-
-/// 前台 App 是否宿主命令行（probe 在 Unknown 时调用，一次 ps ~30ms）
-fn hosts_tty(pid: i32) -> bool {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,tty="])
-        .output()
-    else {
-        return false;
-    };
-    tty_in_subtree(&String::from_utf8_lossy(&out.stdout), pid)
-}
-
-/// 纯核心：ps 三列输出（pid/ppid/tty）里，root 的进程子树内是否有成员带 TTY
-/// （tty 列非 "??" 开头）。BFS + visited 防御异常父指针环，节点数封顶 512。
-fn tty_in_subtree(ps_output: &str, root: i32) -> bool {
-    let mut children: std::collections::HashMap<i32, Vec<i32>> = Default::default();
-    let mut tty_owner: std::collections::HashSet<i32> = Default::default();
-    for line in ps_output.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(p), Some(pp), Some(t)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let (Ok(p), Ok(pp)) = (p.parse::<i32>(), pp.parse::<i32>()) else {
-            continue;
-        };
-        children.entry(pp).or_default().push(p);
-        if !t.starts_with('?') {
-            tty_owner.insert(p);
-        }
-    }
-    let mut queue = std::collections::VecDeque::from([root]);
-    let mut visited = std::collections::HashSet::from([root]);
-    let mut budget = 512; // 防御：异常大子树/环不该拖垮探测
-    while let Some(p) = queue.pop_front() {
-        if budget == 0 {
-            return false;
-        }
-        budget -= 1;
-        if tty_owner.contains(&p) {
-            return true;
-        }
-        for &c in children.get(&p).into_iter().flatten() {
-            if visited.insert(c) {
-                queue.push_back(c);
-            }
-        }
-    }
-    false
-}
-
-// ---------- 探测（死线包裹的真查询） ----------
-
-/// 探测当前输入焦点。实际 AX 查询放独立线程（同步 XPC 可能被卡死的目标 App 拖住），
-/// 整体死线；超时或通道不可用时依次退黑名单，仍无答案则 Unknown。
 pub fn probe(deadline: std::time::Duration) -> ProbeReport {
+    // 前台 App：名单/TTY 兜底的判据 + 观测点（排查"为什么没亮复制按钮"的第一现场）
+    let frontmost = crate::inject::frontmost_app();
+    let pid = frontmost.as_ref().map(|(_, p)| *p);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(ax_probe());
+        let _ = tx.send(ax_probe(pid));
     });
     let report = match rx.recv_timeout(deadline) {
         Ok(r) => r,
@@ -232,10 +194,8 @@ pub fn probe(deadline: std::time::Duration) -> ProbeReport {
             basis: "AX 探测超时（目标 App 无响应）".into(),
         },
     };
-    // 前台 App：名单/TTY 兜底的判据 + 观测点（排查"为什么没亮复制按钮"的第一现场）
-    let frontmost = crate::inject::frontmost_app();
     let report = if report.verdict == Verdict::Unknown {
-        let tty_host = frontmost.as_ref().map(|(_, pid)| hosts_tty(*pid)).unwrap_or(false);
+        let tty_host = frontmost.as_ref().map(|(_, pid)| tty::hosts_tty(*pid)).unwrap_or(false);
         with_app_lists(report, frontmost.as_ref().map(|(b, _)| b.as_str()), tty_host)
     } else {
         report
@@ -245,8 +205,55 @@ pub fn probe(deadline: std::time::Duration) -> ProbeReport {
     report
 }
 
-/// 真实的 AX 三步查询（只在本模块的探测线程里跑）
-fn ax_probe() -> ProbeReport {
+/// 真实的 AX 探测：常规三步链；全灭且是已知前台 pid 时拨开 Electron/Chromium 的
+/// AX 开关后重试。这两类应用的 AX 树默认关闭（查询全灭/-25212）——设
+/// AXManualAccessibility（Electron 认）/ AXEnhancedUserInterface（Chromium 浏览器认）
+/// 为 true 后树会异步建起来，之后逐状态判定可用（Electron 官方文档记载的第三方机制）。
+/// 首轮可能赶不上调用方死线（返回 Unknown 走乐观注入），开关已持久、下一轮就快了。
+fn ax_probe(pid: Option<i32>) -> ProbeReport {
+    let report = ax_query_chain();
+    if report.verdict != Verdict::Unknown {
+        return report;
+    }
+    let Some(pid) = pid else { return report };
+    if !wake_ax(pid) {
+        return report;
+    }
+    // 建树是异步的：小睡重试几拍（超出调用方死线也无妨——线程自嗨，不拖交付）
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let r = ax_query_chain();
+        if r.verdict != Verdict::Unknown {
+            let mut basis = r.basis;
+            basis.push_str("；AX 唤醒后成功");
+            return ProbeReport { verdict: r.verdict, basis };
+        }
+    }
+    let mut basis = report.basis;
+    basis.push_str("；已拨 AX 开关，树未及建好（下一轮应可查）");
+    ProbeReport { verdict: Verdict::Unknown, basis }
+}
+
+/// 拨 Chromium 系的 AX 开关。两个属性都设（Electron 认 Manual、Chrome 认 Enhanced——
+/// 文档实证，见计划书来源）；部分 Electron 版本可能拒绝 set（已知 issue），优雅降级。
+fn wake_ax(pid: i32) -> bool {
+    unsafe {
+        let app = CfRef::new(AXUIElementCreateApplication(pid));
+        if app.is_null() {
+            return false;
+        }
+        let Some(a_manual) = cf_str("AXManualAccessibility") else { return false };
+        let Some(a_enhanced) = cf_str("AXEnhancedUserInterface") else { return false };
+        let manual = AXUIElementSetAttributeValue(app.0, a_manual.0, kCFBooleanTrue) == AX_SUCCESS;
+        let enhanced =
+            AXUIElementSetAttributeValue(app.0, a_enhanced.0, kCFBooleanTrue) == AX_SUCCESS;
+        println!("[focus] AX 开关 pid={pid}：Manual={manual} Enhanced={enhanced}");
+        manual || enhanced
+    }
+}
+
+/// 三步查询（systemwide → focusedApplication → focusedUIElement → editableAncestor）
+fn ax_query_chain() -> ProbeReport {
     unsafe {
         let sys = CfRef::new(AXUIElementCreateSystemWide());
         if sys.is_null() {
@@ -307,18 +314,12 @@ fn ax_probe() -> ProbeReport {
     }
 }
 
-fn copy_attr(el: *const core::ffi::c_void, attr: &CfRef) -> (i32, *const core::ffi::c_void) {
-    let mut v: *const core::ffi::c_void = std::ptr::null();
-    let err = unsafe { AXUIElementCopyAttributeValue(el, attr.0, &mut v) };
-    (err, v)
-}
-
 fn unknown(basis: &str) -> ProbeReport {
     ProbeReport { verdict: Verdict::Unknown, basis: basis.into() }
 }
 
 /// 名单/TTY 兜底：Unknown 时按前台 App 裁决——黑名单 → NoInput；宿主 TTY（终端类，
-/// 通用判定）→ Input；都不是 → 维持 Unknown（调用方按"不注入 + 复制按钮"处理）。
+/// 通用判定）→ Input；都不是 → 维持 Unknown（调用方按乐观注入处理）。
 /// 纯函数（TTY 判定结果由调用方算好传入），断言见 tests。
 fn with_app_lists(mut report: ProbeReport, frontmost: Option<&str>, tty_host: bool) -> ProbeReport {
     if report.verdict == Verdict::Unknown {
@@ -433,40 +434,4 @@ mod tests {
         assert!(with_app_lists(r(Verdict::Unknown), Some("x"), true).basis.contains("宿主命令行"));
     }
 
-    #[test]
-    fn 终端判定_子树宿主tty即命中_与App名字无关() {
-        // 缩样：GUI 进程 51639（无 tty）→ shell 60001（ttys005）；陌生终端同样命中
-        let ps = "  100     1 ??\n51639     1 ??\n60001 51639 ttys005\n60002 60001 ttys005\n";
-        assert!(tty_in_subtree(ps, 51639), "子树里有 shell 带 TTY");
-        assert!(tty_in_subtree(ps, 60001), "自身带 TTY 也算");
-        // 纯 GUI 树（Finder 等）：无任何 TTY
-        let gui = "  200     1 ??\n  201   200 ??\n  202   201 ??\n";
-        assert!(!tty_in_subtree(gui, 200));
-        // 根不存在 / 解析不了的行：安全侧 false
-        assert!(!tty_in_subtree(gui, 999));
-        assert!(!tty_in_subtree("", 51639));
-        assert!(!tty_in_subtree("garbage line", 51639));
-        // 异常环（a↔b 互为父）不陷入死循环
-        let ring = "10 11 ??\n11 10 ??\n";
-        assert!(!tty_in_subtree(ring, 10));
-    }
-
-    #[test]
-    fn 终端判定_预算封顶与脏输入防御() {
-        // 600 长链、TTY 挂在最末端：预算 512 耗尽 → 安全侧 false（不挂起、不误判终端）
-        let mut chain = String::new();
-        for i in 0..600 {
-            chain.push_str(&format!("{} {} ??\n", 10_000 + i, 9_999 + i));
-        }
-        chain.push_str("10600 10599 ttys001\n");
-        assert!(!tty_in_subtree(&chain, 9_999), "超预算子树按非终端处理");
-        // 单问号（无 tty 的另一形态）不算 TTY
-        assert!(!tty_in_subtree("5 4 ?\n", 4));
-        // 表头行（非数字）被跳过，不把解析打崩
-        let with_header = "  PID  PPID  TTY\n7 1 ??\n8 7 ttys009\n";
-        assert!(tty_in_subtree(with_header, 7));
-        // 负 pid 可解析、不 panic，行为与正 pid 一致
-        assert!(tty_in_subtree("-3 -2 ttys001\n", -2));
-        assert!(!tty_in_subtree("-3 -2 ??\n", -2));
-    }
 }

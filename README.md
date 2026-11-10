@@ -98,7 +98,7 @@ npx tauri icon scripts/icon-source.png      # 重新生成全平台图标
 
 ## Roadmap
 
-- v1.1：引擎库（whisper.cpp / sherpa-onnx 可选下载）、"粘贴上次结果"独立快捷键、按住说话模式
+- v1.1：引擎库（whisper.cpp / sherpa-onnx 可选下载）、听写历史管理、按住说话模式
 - v1.2：模型 sha256 校验（等官方公布指纹）、API Key 迁移到钥匙串、按应用注入黑白名单
 
 ## 许可

@@ -2,10 +2,12 @@
 // 铁律：音频回调里只做"把样本倒进桶"（外加一个廉价的音量统计），
 // 打包 WAV、广播事件这些活都留给停止之后的普通线程。
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TARGET_RATE: u32 = 16_000; // 语音识别的标准采样率
 
@@ -20,6 +22,10 @@ pub struct RecordingHandle {
     buf: Arc<Mutex<SharedBuf>>,
     pub level: Arc<AtomicU32>, // RMS * 1000，广播线程每 50ms 读一次
     pub live: Arc<AtomicBool>, // 已收到首个超过死麦线的真实信号 = 采集链路真的活了
+    // 开流计时（毫秒，0 = 尚未发生）：区分"设备预热"与"用户开口反应"的观测点——
+    // 首回调（设备开始送数据，哪怕全零）/ 首非零（麦克真的听到了什么）
+    pub first_cb_ms: Arc<AtomicU32>,
+    pub first_nonzero_ms: Arc<AtomicU32>,
     native_rate: u32,
 }
 
@@ -30,13 +36,48 @@ pub struct RecordingHandle {
 struct SendStream(cpal::Stream);
 unsafe impl Send for SendStream {}
 
-pub fn start() -> Result<RecordingHandle, String> {
-    let device = cpal::default_host()
-        .default_input_device()
-        .ok_or("找不到麦克风设备（检查是否连接/授权）")?;
+// ---------- 开流配置缓存 ----------
+// 每次开流最贵的不是建流，是 supported_input_configs 的全量能力枚举（设备 IO）。
+// 缓存"上次成功"的 (设备名, 采样率, 声道)，命中即跳过枚举直接建流；失配/建流失败
+// 自动回退全量枚举并更新缓存——听写永远不因缓存而不可用。持久化在 mic-cache.json，
+// 重启后的首次开流同样吃缓存。
 
-    // 在设备支持的配置里挑一个最接近目标的：单声道优先、采样率尽量靠近 16k
-    let mut best: Option<(cpal::SupportedStreamConfig, i64)> = None;
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MicCache {
+    pub device: String,
+    pub rate: u32,
+    pub channels: u16,
+}
+
+fn cache_load(path: Option<&Path>) -> Option<MicCache> {
+    serde_json::from_str(&std::fs::read_to_string(path?).ok()?).ok()
+}
+
+fn cache_save(path: Option<&Path>, cache: &MicCache) {
+    let Some(p) = path else { return };
+    if let Ok(json) = serde_json::to_string(cache) {
+        if let Ok(mut f) = std::fs::File::create(p) {
+            let _ = f.write_all(json.as_bytes());
+        }
+    }
+}
+
+// 分段计时落盘（开流各段耗时是"唤醒中还有多长"的决策数据，与 /tmp/sayit-focus.log 同款取证）。
+// pub：commands.rs 的观察线程也要把"首真信号"（设备预热段）写进来——那是保温决策的关键数
+pub fn mic_log(line: &str) {
+    println!("[mic] {line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/sayit-mic.log")
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// 全量能力枚举：单声道优先、采样率尽量靠近 16k（缓存未命中/失效时的完整路径）
+fn pick_config(device: &cpal::Device) -> Result<cpal::StreamConfig, String> {
+    let mut best: Option<(cpal::StreamConfig, i64)> = None;
     for range in device
         .supported_input_configs()
         .map_err(|e| format!("无法读取麦克风能力：{e}"))?
@@ -57,75 +98,160 @@ pub fn start() -> Result<RecordingHandle, String> {
             .map(|(_, prev_score)| score < *prev_score)
             .unwrap_or(true);
         if is_better {
-            best = Some((range.with_sample_rate(cpal::SampleRate(want)), score));
+            best = Some((
+                cpal::StreamConfig {
+                    channels: ch,
+                    sample_rate: cpal::SampleRate(want),
+                    buffer_size: cpal::BufferSize::Default,
+                },
+                score,
+            ));
         }
     }
-    let (config, _) = best.ok_or("麦克风不支持可用的录音格式（需要 F32 输入）")?;
+    best.map(|(c, _)| c)
+        .ok_or_else(|| "麦克风不支持可用的录音格式（需要 F32 输入）".into())
+}
 
-    let channels = config.channels() as usize;
-    let native_rate = config.sample_rate().0;
+pub fn start() -> Result<RecordingHandle, String> {
+    start_with_cache(None)
+}
+
+pub fn start_with_cache(cache_path: Option<&Path>) -> Result<RecordingHandle, String> {
+    let t_total = Instant::now();
+
+    // ① 默认设备
+    let t = Instant::now();
+    let device = cpal::default_host()
+        .default_input_device()
+        .ok_or("找不到麦克风设备（检查是否连接/授权）")?;
+    let device_name = device.name().unwrap_or_default();
+    let ms_dev = t.elapsed().as_millis();
+
+    // ② 选配置：缓存命中 → 直接建（失败回退枚举）；未命中 → 全量枚举
+    let cached = cache_load(cache_path).filter(|c| c.device == device_name);
+    let (config, config_src) = if let Some(c) = cached {
+        let cfg = cpal::StreamConfig {
+            channels: c.channels,
+            sample_rate: cpal::SampleRate(c.rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        (cfg, "缓存命中")
+    } else {
+        (pick_config(&device)?, "全量枚举")
+    };
+    let ms_config = t.elapsed().as_millis() - ms_dev;
+
+    let channels = config.channels as usize;
+    let native_rate = config.sample_rate.0;
     let buf = Arc::new(Mutex::new(SharedBuf {
         samples: Vec::new(),
         rms_idx: 0,
     }));
     let level = Arc::new(AtomicU32::new(0));
     let live = Arc::new(AtomicBool::new(false));
+    let first_cb_ms = Arc::new(AtomicU32::new(0));
+    let first_nonzero_ms = Arc::new(AtomicU32::new(0));
+    let opened_at = Instant::now();
 
-    let stream = device
-        .build_input_stream(
-            &config.into(),
-            {
-                let buf = buf.clone();
-                let level = level.clone();
-                let live = live.clone();
-                move |data: &[f32], _| {
-                    let mut b = match buf.lock() {
-                        Ok(b) => b,
-                        Err(_) => return,
-                    };
-                    // 立体声降混为单声道（左右取平均）
-                    if channels == 2 {
-                        b.samples.extend(data.chunks(2).map(|c| {
-                            if c.len() == 2 {
-                                (c[0] + c[1]) / 2.0
-                            } else {
-                                c[0]
-                            }
-                        }));
-                    } else {
-                        b.samples.extend_from_slice(data);
-                    }
-                    // 每攒够约 50ms 算一次音量（平方和开方 = RMS）
-                    let need = (native_rate / 20) as usize;
-                    if b.samples.len() - b.rms_idx >= need {
-                        let chunk = &b.samples[b.rms_idx..];
-                        let sum: f32 = chunk.iter().map(|s| s * s).sum();
-                        let rms = (sum / chunk.len() as f32).sqrt();
-                        level.store((rms * 1000.0) as u32, Ordering::Relaxed);
-                        // 设备预热会送一段"零数据"（play 成功后 ~0.5s，回调在跑但内容是零，
-                        // 实测本机 USB 耳机麦）——此刻说的话不会被采样。"开录"信号必须
-                        // 是首个超过死麦线（与死麦检测同一条线）的真实信号，加载态才熬得够久
-                        if !live.load(Ordering::Relaxed) && rms > 0.001 {
-                            live.store(true, Ordering::Relaxed);
+    // ③ 建流（缓存配置被设备拒绝 → 回退全量枚举重试一次，缓存跟着换血）
+    let build = |cfg: &cpal::StreamConfig| -> Result<cpal::Stream, String> {
+        device
+            .build_input_stream(
+                cfg,
+                {
+                    let buf = buf.clone();
+                    let level = level.clone();
+                    let live = live.clone();
+                    let first_cb_ms = first_cb_ms.clone();
+                    let first_nonzero_ms = first_nonzero_ms.clone();
+                    move |data: &[f32], _| {
+                        // 观测点：首回调 / 首非零（区分设备预热与用户开口反应，见 RecordingHandle 注释）
+                        let now_ms = opened_at.elapsed().as_millis() as u32;
+                        if first_cb_ms.load(Ordering::Relaxed) == 0 {
+                            first_cb_ms.store(now_ms, Ordering::Relaxed);
                         }
-                        b.rms_idx = b.samples.len();
+                        if first_nonzero_ms.load(Ordering::Relaxed) == 0
+                            && data.iter().any(|s| s.abs() > 0.0005)
+                        {
+                            first_nonzero_ms.store(now_ms, Ordering::Relaxed);
+                        }
+                        let mut b = match buf.lock() {
+                            Ok(b) => b,
+                            Err(_) => return,
+                        };
+                        // 立体声降混为单声道（左右取平均）
+                        if channels == 2 {
+                            b.samples.extend(data.chunks(2).map(|c| {
+                                if c.len() == 2 {
+                                    (c[0] + c[1]) / 2.0
+                                } else {
+                                    c[0]
+                                }
+                            }));
+                        } else {
+                            b.samples.extend_from_slice(data);
+                        }
+                        // 每攒够约 50ms 算一次音量（平方和开方 = RMS）
+                        let need = (native_rate / 20) as usize;
+                        if b.samples.len() - b.rms_idx >= need {
+                            let chunk = &b.samples[b.rms_idx..];
+                            let sum: f32 = chunk.iter().map(|s| s * s).sum();
+                            let rms = (sum / chunk.len() as f32).sqrt();
+                            level.store((rms * 1000.0) as u32, Ordering::Relaxed);
+                            // 设备预热会送一段"零数据"（play 成功后 ~0.5s，回调在跑但内容是零，
+                            // 实测本机 USB 耳机麦）——此刻说的话不会被采样。"开录"信号必须
+                            // 是首个超过开录判定线（RMS>0.001；与死麦线 peak<0.0001 是两条不同的线）的真实信号，加载态才熬得够久
+                            if !live.load(Ordering::Relaxed) && rms > 0.001 {
+                                live.store(true, Ordering::Relaxed);
+                            }
+                            b.rms_idx = b.samples.len();
+                        }
                     }
-                }
-            },
-            |err| eprintln!("[audio] 录音流错误：{err}"),
-            Some(Duration::from_secs(1)),
-        )
-        .map_err(|e| format!("无法打开麦克风：{e}（若刚弹出授权窗，请允许后重试）"))?;
+                },
+                |err| eprintln!("[audio] 录音流错误：{err}"),
+                Some(Duration::from_secs(1)),
+            )
+            .map_err(|e| format!("无法打开麦克风：{e}（若刚弹出授权窗，请允许后重试）"))
+    };
+
+    let (stream, config, config_src) = match build(&config) {
+        Ok(s) => (s, config, config_src),
+        Err(first_err) => {
+            // 缓存配置被拒（设备换了内部格式等）：全量枚举再来一次
+            let config = pick_config(&device).map_err(|_| first_err)?;
+            let s = build(&config)?;
+            (s, config, "缓存失效·回退枚举")
+        }
+    };
 
     stream
         .play()
         .map_err(|e| format!("无法启动录音：{e}"))?;
+
+    // ④ 缓存换血 + 分段计时落盘（"唤醒中"优化的决策数据）
+    cache_save(
+        cache_path,
+        &MicCache {
+            device: device_name,
+            rate: config.sample_rate.0,
+            channels: config.channels,
+        },
+    );
+    mic_log(&format!(
+        "开流完成：设备 {ms_dev}ms + 配置({config_src}) {ms_config}ms + 建流启动 {}ms = 总 {}ms（{}Hz/{}ch）",
+        t_total.elapsed().as_millis() - ms_dev - ms_config,
+        t_total.elapsed().as_millis(),
+        config.sample_rate.0,
+        config.channels,
+    ));
 
     Ok(RecordingHandle {
         stream: SendStream(stream),
         buf,
         level,
         live,
+        first_cb_ms,
+        first_nonzero_ms,
         native_rate,
     })
 }
@@ -231,6 +357,22 @@ fn write_pcm_wav(path: &Path, pcm: &[i16]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 配置缓存_落盘回读一致_损坏文件安全回退() {
+        let path = std::env::temp_dir().join(format!("sayit-mic-cache-test-{}.json", std::process::id()));
+        let c = MicCache { device: "EDIFIER".into(), rate: 48_000, channels: 1 };
+        cache_save(Some(&path), &c);
+        assert_eq!(cache_load(Some(&path)), Some(c));
+        // 损坏内容 → None（安全侧：当作无缓存，回退全量枚举）
+        std::fs::write(&path, "garbage").unwrap();
+        assert_eq!(cache_load(Some(&path)), None);
+        // 路径不存在 → None
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cache_load(Some(&path)), None);
+        // 无路径（selftest 等无缓存调用方）→ None 且不 panic
+        assert_eq!(cache_load(None), None);
+    }
 
     #[test]
     fn 重采样_48k降16k_长度与幅度保持() {

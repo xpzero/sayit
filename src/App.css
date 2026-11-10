@@ -486,48 +486,62 @@ select {
   font-family: inherit;
 }
 
-/* 权限 */
-.perm {
+/* 权限体检条：识别页顶部一行两格（麦克风/辅助功能）——默认落地页，进设置第一眼即见 */
+.perm-strip {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.perm-cell {
+  flex: 1;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 0;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--card);
+  cursor: pointer;
+  font-family: inherit;
+  min-width: 0;
 }
-.perm + .perm,
-.perm + p {
-  border-top: 1px dashed var(--line);
+.perm-cell:hover {
+  border-color: var(--line);
 }
-.perm .st {
-  width: 34px;
-  height: 34px;
-  border-radius: 50%;
-  display: grid;
-  place-items: center;
-  font-size: 15px;
-  flex-shrink: 0;
+.perm-cell b {
+  font-size: 12.5px;
+  color: var(--ink);
+  white-space: nowrap;
 }
-.perm .st.ok {
+.perm-cell small {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.perm-cell.ok {
+  border-color: var(--green);
   background: var(--green-soft);
+}
+.perm-cell.ok small {
   color: var(--green);
 }
-.perm .st.no {
+.perm-cell.bad {
+  border-color: var(--seal);
   background: var(--seal-soft);
+}
+.perm-cell.bad small {
   color: var(--seal);
 }
-.perm b {
-  font-size: 13.5px;
-  display: block;
-  color: var(--ink);
+/* 警告档（有声但轻——不是故障，琥珀色与状态灯 warm 同族） */
+.perm-cell.warn {
+  border-color: #d9a441;
+  background: #faf0dc;
 }
-.perm small {
-  color: var(--muted);
-  font-size: 11.5px;
-}
-.perm .btn {
-  margin-left: auto;
-}
-.perm .btn + .btn {
-  margin-left: 0;
+.perm-cell.warn small {
+  color: #a87c1f;
 }
 
 /* 关于 */
@@ -713,4 +727,51 @@ canvas.wave {
   .grid2 {
     grid-template-columns: 1fr;
   }
+}
+
+/* ---------- 听写历史（设置→历史） ---------- */
+.sect {
+  display: flex;
+  align-items: center;
+}
+.hist-spacer {
+  flex: 1;
+}
+.hist-empty {
+  text-align: center;
+  color: var(--muted);
+  padding: 30px;
+}
+.hist-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 0;
+}
+.hist-item + .hist-item {
+  border-top: 1px dashed var(--line);
+}
+.hist-time {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--faint);
+  padding-top: 3px;
+  white-space: nowrap;
+}
+.hist-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+.hist-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 6px;
 }

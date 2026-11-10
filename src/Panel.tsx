@@ -206,16 +206,10 @@ export default function Panel() {
                 未插入 · 去开辅助功能权限
               </button>
             )}
-            {badge === "clipboard_failed" && (
-              <span className="injected-badge miss">未自动插入 · 剪贴板暂不可用，请手动复制</span>
-            )}
             {badge === "no_input_focus" && (
-              <span className="injected-badge miss">没在输入框 · 文本在剪贴板，可点复制或手动 ⌘V</span>
+              <span className="injected-badge miss">没在输入框 · 点复制取回（历史在设置）</span>
             )}
-            {badge === "focus_unknown" && (
-              <span className="injected-badge miss">未确认输入框 · 文本在剪贴板，可点复制或手动 ⌘V</span>
-            )}
-            {badge === "miss" && <span className="injected-badge miss">未自动插入 · 文本在剪贴板</span>}
+            {badge === "miss" && <span className="injected-badge miss">未自动插入 · 点复制取回（历史在设置）</span>}
             <button
               className="pill-btn"
               onClick={(ev) => {
@@ -223,7 +217,10 @@ export default function Panel() {
                   .then(() => {
                     ev.currentTarget.textContent = "已复制 ✓";
                   })
-                  .catch(() => {});
+                  .catch(() => {
+                    // 复制失败必须可见（剪贴板最小侵入契约：点复制才写，写失败不能无声）
+                    ev.currentTarget.textContent = "复制失败 ✗";
+                  });
               }}
             >
               复制

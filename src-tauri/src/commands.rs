@@ -3,9 +3,10 @@ use crate::audio;
 use crate::config::{self, Config};
 use crate::engines;
 use crate::hotkey;
-use crate::models;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use crate::panel;
+use crate::system;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 #[tauri::command]
@@ -69,7 +70,7 @@ fn toggle_core(app: &AppHandle) {
             });
             if !ready {
                 drop(s);
-                show_panel(app);
+                panel::show_panel(app);
                 let _ = app.emit(
                     "result",
                     serde_json::json!({ "error": "还没有可用的识别模型", "reason": "no_model" }),
@@ -113,11 +114,13 @@ fn send_event(
             if let Some(h) = stream.take() {
                 let live = h.live.clone();
                 let level = h.level.clone();
+                let first_cb = h.first_cb_ms.clone();
+                let first_nonzero = h.first_nonzero_ms.clone();
                 s.level = Some(level.clone());
                 s.broadcasting.store(true, Ordering::Relaxed);
                 let flag = s.broadcasting.clone();
                 s.recording = Some(h);
-                watch = Some((live, level, flag));
+                watch = Some((live, level, flag, first_cb, first_nonzero));
             }
         }
         (effects, watch)
@@ -129,11 +132,13 @@ fn send_event(
     }
 }
 
-/// 观察三元组：(live 真信号标志, level 音量, broadcasting 运行开关)
+/// 观察五元组：(live 真信号, level 音量, broadcasting 开关, 首回调 ms, 首非零 ms)
 type Watch = Option<(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     std::sync::Arc<std::sync::atomic::AtomicU32>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
+    std::sync::Arc<std::sync::atomic::AtomicU32>,
 )>;
 
 fn run_effects(
@@ -151,8 +156,8 @@ fn run_effects(
             Effect::InstallAndWatch => {
                 // 流已在 send_event 的锁内装好，这里只起观察线程；
                 // 若中途已被停止（broadcasting=false），线程首拍即自然退出
-                if let Some((live, level, flag)) = watch.take() {
-                    spawn_watch_thread(app, live, level, flag);
+                if let Some((live, level, flag, first_cb, first_nonzero)) = watch.take() {
+                    spawn_watch_thread(app, live, level, flag, first_cb, first_nonzero);
                 }
             }
             Effect::AnnounceRecording => {
@@ -171,7 +176,7 @@ fn run_effects(
             Effect::DiscardStream => discard_stream(app, state),
             Effect::GoIdle => {
                 let _ = app.emit("recording", serde_json::json!({ "active": false }));
-                hide_panel(app.clone());
+                panel::hide_panel(app.clone());
             }
         }
     }
@@ -179,20 +184,27 @@ fn run_effects(
 
 // 效果：开新篇——面板先进"唤醒中"，开麦在后台线程（可阻塞秒级，绝不许抱主线程）
 fn spawn_opener(app: &AppHandle, cfg: &config::Config) {
-    show_panel(app);
+    panel::show_panel(app);
     let _ = app.emit(
         "recording",
         serde_json::json!({ "active": true, "opening": true, "model": display_model(cfg) }),
     );
     let app2 = app.clone();
+    // 开流配置缓存：命中则跳过设备能力枚举（分段计时见 /tmp/sayit-mic.log）
+    let cache_path = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("mic-cache.json"));
     std::thread::spawn(move || {
         // 第一次失败先别急着报错：瞬态驱动故障（USB 声卡 StartIO 被拒之类）通常亚秒自愈，
         // 歇 500ms 重试一次；仍失败才以第一次的错误示人（第一次的更贴近根因）
-        let handle = match audio::start() {
+        let open = || audio::start_with_cache(cache_path.as_deref());
+        let handle = match open() {
             Ok(h) => h,
             Err(first) => {
                 std::thread::sleep(Duration::from_millis(500));
-                match audio::start() {
+                match open() {
                     Ok(h) => h,
                     Err(_) => {
                         send_event(&app2, crate::dictation::Event::MicFailed(first), None);
@@ -208,13 +220,15 @@ fn spawn_opener(app: &AppHandle, cfg: &config::Config) {
 // 效果：起音量广播 + 开录判定线程（每 50ms 一拍）。流已在 send_event 的锁内装好。
 // "正式开录" = 首个真实信号（RMS 越过死麦线），不是"第一个回调"——设备预热期
 // 回调在跑但送零数据，此刻说的话不会被采样；"看到声纹=可以说话"才是可信承诺。
-// 2s 兜底：设备只送全零（权限被拒）或首帧奇慢也不能永远卡在加载态。
+// 700ms 时间基准（2026-11-10 实测改的）：预热实测 435-570ms，原 2s 造成等待死锁。
 // 宣布与否、宣布几次，全部由状态机裁定（重复信号在 Recording(已宣布) 下是 Ignored）
 fn spawn_watch_thread(
     app: &AppHandle,
     live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     level: std::sync::Arc<std::sync::atomic::AtomicU32>,
     flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    first_cb_ms: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    first_nonzero_ms: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let app3 = app.clone();
     std::thread::spawn(move || {
@@ -226,9 +240,22 @@ fn spawn_watch_thread(
             let _ = app3.emit("level", serde_json::json!({ "rms": v }));
             if !signal_sent && live.load(Ordering::Relaxed) {
                 signal_sent = true;
+                // 三拍分解：首回调（设备开始送数据）/ 首非零（麦克听到了东西）/ 越死麦线（RMS 达标）。
+                // 首非零-首回调 ≈ 设备预热；越线-首非零 ≈ 用户开口反应——保温与兜底阈值靠这组数定
+                crate::audio::mic_log(&format!(
+                    "三拍：首回调 {}ms → 首非零 {}ms → 越死麦线 +{}ms",
+                    first_cb_ms.load(Ordering::Relaxed),
+                    first_nonzero_ms.load(Ordering::Relaxed),
+                    started.elapsed().as_millis()
+                ));
                 send_event(&app3, crate::dictation::Event::Signal, None);
             }
-            if !signal_sent && !timeout_sent && started.elapsed() >= Duration::from_secs(2) {
+            if !signal_sent && !timeout_sent && started.elapsed() >= Duration::from_millis(700) {
+                // 时间基准的开录宣布（2026-11-10 三拍实测改的）：设备预热实测 435–570ms
+                // （首非零-首回调），原 2s 兜底 + "等真信号"造成等待死锁——面板等用户
+                // 开口、用户等声纹亮起，2.4s 的"越线延迟"全是用户在等红灯（训练效应）。
+                // 700ms = 预热上限 + 余量：过了这村硬件必然在收声，红灯就是诚实的
+                // "可以说话"；说话越线（Signal）仍会提前触发，谁先到谁宣布
                 timeout_sent = true;
                 send_event(&app3, crate::dictation::Event::ArmTimeout, None);
             }
@@ -340,6 +367,8 @@ fn deliver(
         crate::dictation::SttOutcome::Text(text) => {
             let mode = cfg.injection.mode.clone();
             let app3 = app.clone();
+            // 记入历史（注入与否都记）——"文字不丢"的兜底：设置→历史，逐条显式复制
+            crate::history::record_history(app, &text);
             std::thread::spawn(move || {
                 let report = crate::focus::probe(Duration::from_millis(300));
                 if report.verdict == crate::focus::Verdict::NoInput {
@@ -351,33 +380,22 @@ fn deliver(
                     if stale {
                         println!("[focus] 交付迟到（周期已翻篇）：抑制面板事件，注入照常");
                     }
-                    // 契约（用户拍板）：只有确认在输入框才注入。非输入态/判不出都不注入，
-                    // 文本进剪贴板 + 结果胶囊亮复制按钮让用户自己落位——AX 盲 App 里
-                    // "真在输入框"与"非输入态"不可区分，一视同仁走按钮，文字不丢。
-                    // 例外：辅助功能未授权时放行走注入路径——那里会产出 NeedPermission
-                    // 并自动带路开设置（否则用户永远只看到复制按钮，不知道要先授权）
-                    if report.verdict != crate::focus::Verdict::Input
+                    // 注入契约（2026-11-10 终稿 E + 剪贴板最小侵入）：确认非输入态
+                    // （黑名单/AX 判定）才跳过注入并亮复制按钮——此时**不写剪贴板**
+                    // （用户剪贴板里可能是自己的内容，不能霸占）；文字不丢由听写历史
+                    // 保证（设置→历史，逐条显式复制），复制按钮点击时才写剪贴板。
+                    // 判不出（AX 盲 App）照常注入：用户在此按键本身就是意图声明。
+                    // 例外：辅助功能未授权时放行走注入路径——产出 NeedPermission 并自动带路
+                    if report.verdict == crate::focus::Verdict::NoInput
                         && crate::inject::accessibility_ok()
                     {
-                        // 剪贴板写失败要换徽标——不能一边失败一边承诺"文本在剪贴板"
-                        let cb_failed = crate::inject::copy_to_clipboard(&text).is_err();
-                        if cb_failed {
-                            eprintln!("[inject] 非输入态回退写剪贴板失败");
-                        }
-                        let reason = if cb_failed {
-                            "clipboard_failed"
-                        } else if report.verdict == crate::focus::Verdict::NoInput {
-                            "no_input_focus"
-                        } else {
-                            "focus_unknown"
-                        };
                         if !stale {
                             let _ = app4.emit(
                                 "result",
                                 serde_json::json!({
                                     "text": text,
                                     "injected": false,
-                                    "reason": reason
+                                    "reason": "no_input_focus"
                                 }),
                             );
                         }
@@ -395,8 +413,8 @@ fn deliver(
                             // 自动带路：系统不许可弹窗，但我们可以自动翻到正确的设置页
                             // （每次运行只自动开一次；翻开关那一下永远必须用户亲手+密码。
                             // 迟到交付不弹——别在新一轮录音中途抢焦点开设置页）
-                            if !stale && !AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
-                                let _ = open_accessibility_page(&app4);
+                            if !stale && !system::AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
+                                let _ = system::open_accessibility_page(&app4);
                             }
                             (false, Some("accessibility".to_string()))
                         }
@@ -420,30 +438,6 @@ fn deliver(
     }
 }
 
-// ---------- 输入焦点体检（取证仪器：判定 + AX 原始错误码 + 前台 App，见 focus.rs） ----------
-
-#[tauri::command]
-pub fn focus_selftest(app: AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        // 设置窗本身可聚焦——立即探测只会测到 Sayit 自己的按钮（结构上不可能报 Input）。
-        // 先广播"等待"给用户 3 秒把焦点点进真正要测的现场，再探测
-        let _ = app.emit("focus-selftest", serde_json::json!({ "stage": "waiting" }));
-        std::thread::sleep(Duration::from_secs(3));
-        // 体检给足死线（交付路径只给 300ms，这里要的是准确不是快）
-        let report = crate::focus::probe(Duration::from_millis(1000));
-        let _ = app.emit(
-            "focus-selftest",
-            serde_json::json!({
-                "stage": "done",
-                "verdict": format!("{:?}", report.verdict),
-                "basis": report.basis,
-                "frontmost": crate::inject::frontmost_app().map(|(b, _)| b),
-                "axTrusted": crate::inject::accessibility_ok(),
-            }),
-        );
-    });
-}
 
 // 效果：丢弃在装流（录音中被 Esc）。随事件附带的"迟到流"不进这里——
 // 它从未采样，send_event 的收尾直接丢弃即可；这里只处理已采样的流：写盘即删（与旧实现一致）
@@ -463,286 +457,6 @@ fn discard_stream(app: &AppHandle, state: &State<'_, crate::state::SharedState>)
         }
     }
 }
-
-#[tauri::command]
-pub fn hide_panel(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("panel") {
-        let _ = win.hide();
-    }
-}
-
-// 打开设置页（可选直达某个 tab：rec/model/key/cloud/perm/about）
-#[tauri::command]
-pub fn open_settings(app: AppHandle, tab: Option<String>) {
-    if let Some(win) = app.get_webview_window("settings") {
-        let _ = win.show();
-        let _ = win.set_focus();
-        if let Some(t) = tab {
-            let _ = app.emit("goto-tab", serde_json::json!({ "tab": t }));
-        }
-    }
-}
-
-// ---------- 麦克风自检（后台线程干活，完成后广播结果） ----------
-
-#[tauri::command]
-pub fn mic_selftest(app: AppHandle) {
-    let app = app.clone();
-    std::thread::spawn(move || {
-        let _ = app.emit("selftest", serde_json::json!({ "stage": "recording" }));
-        match audio::selftest(1500) {
-            Ok(r) => {
-                let verdict = if r.samples == 0 {
-                    "设备没有送来任何数据（可能被占用或未授权）".to_string()
-                } else if r.peak < 0.0001 {
-                    "完全静音：macOS 很可能拒绝了麦克风权限（被拒的应用只会收到全零数据、不再弹窗）。\n请点旁边按钮打开系统设置 → 麦克风，给运行本应用的工具（终端/ZCode）打勾".to_string()
-                } else if r.peak < 0.01 {
-                    format!("能收到声音但很轻（峰值 {:.0}%）——离麦克风近一点再试", r.peak * 100.0)
-                } else {
-                    format!("麦克风工作正常 ✓ 峰值 {:.0}%，对着它说话试试快捷键", r.peak * 100.0)
-                };
-                let _ = app.emit(
-                    "selftest",
-                    serde_json::json!({ "stage": "done", "verdict": verdict, "ok": r.peak >= 0.01 && r.samples > 0 }),
-                );
-            }
-            Err(e) => {
-                let _ = app.emit(
-                    "selftest",
-                    serde_json::json!({ "stage": "error", "message": e }),
-                );
-            }
-        }
-    });
-}
-
-// 深链直达系统设置的麦克风授权页
-#[tauri::command]
-pub fn open_mic_settings(app: AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
-            None::<&str>,
-        )
-        .map_err(|e| e.to_string())
-}
-
-// ---------- 注入兜底（步骤 7） ----------
-
-// 辅助功能授权状态（设置页权限体检用）
-#[tauri::command]
-pub fn accessibility_status() -> bool {
-    crate::inject::accessibility_ok()
-}
-
-// 面板"复制"按钮：只写剪贴板
-#[tauri::command]
-pub fn copy_text(text: String) -> Result<(), String> {
-    crate::inject::copy_to_clipboard(&text)
-}
-
-// 深链直达辅助功能授权页（模拟按键的前提）
-#[tauri::command]
-pub fn open_accessibility_settings(app: AppHandle) -> Result<(), String> {
-    open_accessibility_page(&app)
-}
-
-fn open_accessibility_page(app: &AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    // 新版系统设置的隐私面板链接格式（旧格式 com.apple.preference.universalaccess
-    // 会打开"辅助功能功能页"而不是授权列表——实测踩坑）
-    app.opener()
-        .open_url(
-            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
-            None::<&str>,
-        )
-        .map_err(|e| e.to_string())
-}
-
-// 自动带路的节流开关：每次运行只自动打开一次（反复弹设置页会烦人）
-static AUTO_OPENED_ACCESSIBILITY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-// ---------- 快捷键捕获 ----------
-
-#[tauri::command]
-pub fn start_hotkey_capture() {
-    crate::hotkey::tap::start_capture();
-}
-
-#[tauri::command]
-pub fn stop_hotkey_capture() {
-    crate::hotkey::tap::stop_capture();
-}
-
-// 深链直达系统设置的键盘页（启用 Fn 需把 🌐 键行为设为"无操作"）
-#[tauri::command]
-pub fn open_keyboard_settings(app: AppHandle) -> Result<(), String> {
-    use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_url(
-            "x-apple.systempreferences:com.apple.preference.keyboard",
-            None::<&str>,
-        )
-        .map_err(|e| e.to_string())
-}
-
-// ---------- 模型库（步骤 3） ----------
-
-#[tauri::command]
-pub fn get_model_library(app: AppHandle) -> Vec<models::LibraryItem> {
-    models::library(&app)
-}
-
-#[tauri::command]
-pub fn download_model(app: AppHandle, state: State<'_, crate::state::SharedState>, id: String) {
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let s = state.lock().unwrap();
-        let mut dls = s.downloads.lock().unwrap();
-        // 同一个模型不重复开下
-        if dls.contains_key(&id) {
-            return;
-        }
-        dls.insert(id.clone(), flag.clone());
-    }
-
-    let app = app.clone();
-    std::thread::spawn(move || {
-        // 点击立即有反馈：先播报"开始连接"，绝不无声无息
-        let _ = app.emit(
-            "download-progress",
-            serde_json::json!({ "id": id, "stage": "progress", "pct": 0, "note": "开始连接…" }),
-        );
-        // 防崩保护：线程内 panic 也要变成可见的错误事件
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            models::download(&app, &id, flag)
-        }));
-        match result {
-            Ok(Ok(())) => {} // download() 内部已广播 done/cancelled
-            Ok(Err(e)) => {
-                let _ = app.emit(
-                    "download-progress",
-                    serde_json::json!({ "id": id, "stage": "error", "message": e }),
-                );
-            }
-            Err(_) => {
-                let _ = app.emit(
-                    "download-progress",
-                    serde_json::json!({ "id": id, "stage": "error", "message": "下载线程内部异常，请重试" }),
-                );
-            }
-        }
-        // 收摊：无论成败都摘掉取消标记（否则点第二次会被"已在下载"挡住）
-        if let Some(state) = app.try_state::<crate::state::SharedState>() {
-            if let Ok(s) = state.lock() {
-                if let Ok(mut dls) = s.downloads.lock() {
-                    dls.remove(&id);
-                }
-            }
-        }
-    });
-}
-
-#[tauri::command]
-pub fn cancel_download(app: AppHandle, state: State<'_, crate::state::SharedState>, id: String) {
-    if let Ok(s) = state.lock() {
-        if let Ok(dls) = s.downloads.lock() {
-            if let Some(flag) = dls.get(&id) {
-                flag.store(true, Ordering::Relaxed);
-            }
-        }
-    }
-    let _ = app;
-}
-
-#[tauri::command]
-pub fn delete_model(app: AppHandle, id: String) -> Result<(), String> {
-    // 引擎可能正跑在这个模型上，先停掉
-    crate::stt::local::kill_engine(&app);
-    // 精选模型：删目录；自带模型：只从清单移除（文件是用户的，不动）
-    if models::catalog().iter().any(|m| m.id == id) {
-        let dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| e.to_string())?
-            .join("models")
-            .join(&id);
-        std::fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
-    } else {
-        let mut cfg = config::load(&app);
-        cfg.model_library.retain(|e| e.id != id);
-        if cfg.stt.local_model_id.as_deref() == Some(id.as_str()) {
-            cfg.stt.local_model_id = None;
-        }
-        config::save(&app, &cfg)?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn add_user_model(app: AppHandle, paths: Vec<String>) -> Result<String, String> {
-    models::register_user_files(&app, &paths)
-}
-
-#[tauri::command]
-pub fn set_default_model(app: AppHandle, id: String) -> Result<(), String> {
-    // 只有"就绪"的模型才有资格当默认
-    let item = models::library(&app)
-        .into_iter()
-        .find(|m| m.id == id && m.status == "ready")
-        .ok_or("模型不存在或未就绪")?;
-    let mut cfg = config::load(&app);
-    if cfg.stt.local_model_id.as_deref() != Some(item.id.as_str()) {
-        crate::stt::local::kill_engine(&app); // 换默认模型 = 引擎要换血
-    }
-    cfg.stt.local_model_id = Some(item.id);
-    config::save(&app, &cfg)
-}
-
-// 面板窗口固定尺寸（520×170，见 tauri.conf.json）：一切状态切换都是胶囊在固定窗口内
-// 的 CSS 动效。动态贴合内容的三种实现（瞬移/步进动画/透明帧掩护瞬移）均实测有肉眼
-// 抖动——窗口服务 set_size/set_position 异步非原子 + WKWebView 陈旧帧拉伸/视口异步，
-// 竞态砍不尽；固定几何是唯一稳定解（详见 AGENTS.md「面板窗口」条）。
-const PANEL_BOTTOM_GAP: f64 = 96.0; // 距屏幕底部留白（避开 Dock 区域）
-
-// 主屏底部居中摆位（先摆位再显示，避免闪跳）
-fn center_panel_bottom(win: &tauri::WebviewWindow, w: f64, h: f64) {
-    if let Ok(Some(mon)) = win.primary_monitor() {
-        let sf = mon.scale_factor();
-        let mw = mon.size().width as f64 / sf;
-        let mh = mon.size().height as f64 / sf;
-        let x = (mw - w) / 2.0;
-        let y = (mh - h - PANEL_BOTTOM_GAP).max(0.0);
-        let _ = win.set_position(tauri::LogicalPosition::new(x, y));
-    }
-}
-
-/// 启动时摆一次面板位（窗口几何恒定，之后 show/hide 不再碰位置——show 路径零窗口操作）
-pub fn position_panel(app: &AppHandle) {
-    let Some(win) = app.get_webview_window("panel") else {
-        return;
-    };
-    if let Ok(size) = win.outer_size() {
-        let sf = win
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .map(|m| m.scale_factor())
-            .unwrap_or(2.0);
-        center_panel_bottom(&win, size.width as f64 / sf, size.height as f64 / sf);
-    }
-}
-
-fn show_panel(app: &AppHandle) {
-    // 摆位只在启动时做一次（position_panel）；此处纯显示——面板出现的路径上
-    // 没有任何 set_size/set_position，物理上不存在几何抖动源
-    if let Some(win) = app.get_webview_window("panel") {
-        let _ = win.show();
-    }
-}
-
 fn display_model(cfg: &Config) -> String {
     match cfg.stt.provider.as_str() {
         "openai_compatible" => format!("云端 · {}", cfg.stt.cloud.model),

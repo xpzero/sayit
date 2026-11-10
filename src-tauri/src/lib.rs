@@ -5,11 +5,14 @@ mod config;
 mod dictation;
 mod engines;
 mod focus;
+mod history;
 mod hotkey;
 mod inject;
 mod models;
+mod panel;
 mod state;
 mod stt;
+mod system;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -50,7 +53,10 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // 面板窗口启动时摆好位（几何恒定，此后 show/hide 不再碰位置）
-            commands::position_panel(app.handle());
+            panel::position_panel(app.handle());
+
+            // 听写历史（设置页「历史」的数据源）
+            history::load_history(app.handle());
 
             // 启动即读一次配置——首次运行会自动落一份默认 config.json
             let _ = config::load(app.handle());
@@ -93,23 +99,25 @@ pub fn run() {
             commands::save_config,
             commands::detect_engine,
             commands::toggle_recording,
-            commands::hide_panel,
-            commands::mic_selftest,
-            commands::open_mic_settings,
-            commands::focus_selftest,
-            commands::get_model_library,
-            commands::download_model,
-            commands::cancel_download,
-            commands::delete_model,
-            commands::add_user_model,
-            commands::set_default_model,
-            commands::start_hotkey_capture,
-            commands::stop_hotkey_capture,
-            commands::open_keyboard_settings,
-            commands::copy_text,
-            commands::open_settings,
-            commands::open_accessibility_settings,
-            commands::accessibility_status
+            panel::hide_panel,
+            panel::open_settings,
+            system::mic_selftest,
+            system::open_mic_settings,
+            system::accessibility_status,
+            system::copy_text,
+            system::open_accessibility_settings,
+            system::open_keyboard_settings,
+            models::get_model_library,
+            models::download_model,
+            models::cancel_download,
+            models::delete_model,
+            models::add_user_model,
+            models::set_default_model,
+            history::get_history,
+            history::delete_history,
+            history::clear_history,
+            hotkey::start_hotkey_capture,
+            hotkey::stop_hotkey_capture,
         ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application")

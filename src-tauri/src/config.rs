@@ -60,7 +60,6 @@ pub struct ModelEntry {
 #[serde(rename_all = "camelCase", default)]
 pub struct HotkeyConfig {
     pub dictation: Vec<String>,
-    pub paste_last_result: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,7 +129,6 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             dictation: vec!["Option+Space".into()],
-            paste_last_result: Vec::new(),
         }
     }
 }
