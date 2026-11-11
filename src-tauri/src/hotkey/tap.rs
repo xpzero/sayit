@@ -272,7 +272,11 @@ fn handle_key_down(app: &AppHandle, kc: u16, flags: u64) -> bool {
                     *g = Some(name);
                 }
             }
-            _ => {} // 键码表之外的键：丢弃（录进去只会产出注册不了的垃圾条目）
+            _ => {
+                // 键码表外的键（如 A：键码 0 因轮询幽灵读数被真相表除名，见 mod.rs）：
+                // 静默丢弃会被当成“没录上”的 bug（2026-11-11 用户实测撞上）——给可见反馈
+                let _ = app.emit("hotkey-rejected", serde_json::json!({ "keycode": kc }));
+            }
         }
         return false; // 录制期一律放行（用户在录入新键，原样到达输入框）
     }

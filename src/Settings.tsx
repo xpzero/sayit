@@ -106,8 +106,11 @@ export default function Settings() {
         }
       }
     });
-    // 后端 tap 的捕获事件：keyup 提交组合 / Fn 与 Menu 令牌；cancelled = Esc 退出
+    // 后端 tap 的捕获事件：keyup 提交组合 / Fn 与 Menu 令牌；cancelled = Esc 退出。
+    // 提交即清预览——组合已变成 chip，输入框里那份实时预览不清就会和新 chip 并排重复
+    // （2026-11-11 用户实测发现）；Esc 退出同理清掉残留的半截预览
     const un3b = listen<{ key?: string; cancelled?: boolean }>("hotkey-captured", (e) => {
+      setPreview(null);
       if (e.payload.cancelled) return;
       const key = e.payload.key;
       if (key) addHotkeyRef.current?.(key);
@@ -121,6 +124,10 @@ export default function Settings() {
       const cur = cfgRef.current;
       if (cur && cur.hotkeys.dictation.length > 0)
         removeHotkeyRef.current?.(cur.hotkeys.dictation[cur.hotkeys.dictation.length - 1]);
+    });
+    // 键码表外的键（如 A）：后端拒绝录入，预览位亮原因——不再是“按了没反应”
+    const un3e = listen("hotkey-rejected", () => {
+      setPreview("✗ 此键不可用作快捷键主键（如 A 键）");
     });
     // 深链直达某个 tab（如"未配置模型"面板按钮 → 模型库）。
     // 旧 id 兼容：「云端」已并入识别页、「权限」已是常驻体检条（无需跳转）
@@ -157,6 +164,7 @@ export default function Settings() {
       un3b.then((f) => f());
       un3c.then((f) => f());
       un3d.then((f) => f());
+      un3e.then((f) => f());
       un4.then((f) => f());
       clearInterval(timer);
     };

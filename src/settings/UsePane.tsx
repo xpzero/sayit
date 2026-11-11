@@ -58,7 +58,7 @@ export function UsePane(p: {
               />
             </div>
             <p className="muted small-top">
-              修饰符（⌘⌃⌥⇧）+ 任意键：字母数字、F1-F20、Home / End / PgUp / PgDn、Ins /
+              修饰符（⌘⌃⌥⇧）+ 任意键：字母数字（A 除外——系统键码怪癖，录不进去）、F1-F20、Home / End / PgUp / PgDn、Ins /
               Del、小键盘、方向键、反引号；🌐 Fn 与 PC 键盘的 Menu
               键单独点按录入。系统保留组合（⌘Tab 等）无法捕获。
               注册的快捷键为<b>全局独占</b>：按下不会再传递给其他应用。
