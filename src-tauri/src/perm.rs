@@ -1,9 +1,11 @@
 // 权限门：热键前置检查——麦克风被拒或辅助功能未开时，录音按键失效。
-// 调用方 commands.rs toggle_core（开新篇路径）；带路与节流开关在 system.rs。
+// 调用方 commands.rs toggle_core（开新篇路径）。
 //
-// 契约（2026-11-10 用户拍板，B 案）：静默拦 + 每次运行首次被拦时自动带路开对应设置页。
-// - 麦克风"未询问"（notDetermined）必须放行：系统授权弹窗只在 App 第一次真正开麦时出现，
-//   拦掉就永远拿不到弹窗（死锁）。只在明确拒绝（denied）或受限（restricted）时拦。
+// 契约（2026-11-10 B 案 → 2026-11-11 两次用户拍板修订）：
+// - 未询问 → 授权弹窗先行（requestAccess，面板不上场）；允许 → 自动开录，拒绝 → 提示面板。
+// - 麦克风"未询问"（notDetermined）：requestAccess 触发系统弹窗，面板不上场（消除
+//   死麦早停与弹窗的竞态）；点允许接续按键意图自动开录，点拒绝弹 mic_denied 提示面板。
+// - 麦克风明确拒绝/受限 → 提示面板（文案 + 去系统设置按钮，点击才跳）。
 // - 辅助功能无"未询问"可言（系统不弹窗、只能用户手动开）：AXIsProcessTrusted()==false 即拦。
 // - 查询是 TCC 缓存读（微秒级），每次按键实时查——系统设置里授权后无需重启。
 // - 查询失败按放行（fail-open）：拦错会让按键全死；误放行最多浪费一次说话，
@@ -19,28 +21,35 @@ pub enum Blocked {
 
 // ---------- 纯核心（断言见 mod tests） ----------
 
-/// 麦克风授权状态是否放行。AVAuthorizationStatus：0 未询问 / 1 受限 / 2 拒绝 / 3 已授权。
-/// 未询问放行（首开麦要触发系统弹窗）；未知值不冒充放行。
-pub fn mic_status_allowed(status: i32) -> bool {
-    status == 0 || status == 3
+/// 权限门三值判定（断言见 mod tests）：
+/// Pass = 放行；Prompt = 弹提示面板（文案与按钮见 Panel.tsx）；
+/// RequestMic = 麦克风"未询问"——系统授权弹窗先行，面板不上场（2026-11-11 拍板）。
+/// 辅助功能优先报（它拦得更彻底：热键注入全链路都依赖它）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateAction {
+    Pass,
+    Prompt(Blocked),
+    RequestMic,
 }
 
-/// 权限门判定。辅助功能优先报（它拦得更彻底：热键注入全链路都依赖它）。
-pub fn gate_decision(mic_allowed: bool, ax_trusted: bool) -> Option<Blocked> {
+pub fn gate_decision(mic_status: i32, ax_trusted: bool) -> GateAction {
     if !ax_trusted {
-        Some(Blocked::Accessibility)
-    } else if !mic_allowed {
-        Some(Blocked::Mic)
-    } else {
-        None
+        return GateAction::Prompt(Blocked::Accessibility);
+    }
+    match mic_status {
+        3 => GateAction::Pass,                // 已授权
+        0 => GateAction::RequestMic,          // 未询问：requestAccess 弹窗先行
+        _ => GateAction::Prompt(Blocked::Mic), // 1 受限 / 2 拒绝 / 未知值不冒充放行
     }
 }
 
 // ---------- IO 壳 ----------
 
 /// AVCaptureDevice.authorizationStatus(for: .audio)。查询失败返回 None（调用方按放行处理）。
+/// 也是命令：设置页权限体检格读它做三态分流（3 已授权/0 未询问/1、2 拒绝·受限）。
 /// 用 Class::get 而非 class! 宏：宏找不到类会直接 panic，这是按键路径，绝不能赌
 /// AVFoundation 随 WebKit 传递加载一直成立（实测当前成立，2026-11-10 vmmap 验证）。
+#[tauri::command]
 #[cfg(target_os = "macos")]
 pub fn mic_status() -> Option<i32> {
     use objc2::{msg_send, runtime::Class, runtime::AnyObject};
@@ -62,33 +71,29 @@ pub fn mic_status() -> Option<i32> {
     }
 }
 
+#[tauri::command]
 #[cfg(not(target_os = "macos"))]
 pub fn mic_status() -> Option<i32> {
     Some(3) // 非 macOS 无此机制，视为已授权
 }
 
-/// 麦克风放行判定（IO 壳）。查询失败按放行（fail-open，见文件头）。
-pub fn mic_allowed() -> bool {
-    mic_status().map(mic_status_allowed).unwrap_or(true)
-}
-
-/// 权限门入口：每次开新篇的按键调用。None = 放行。
-/// 观测点：原始状态值逐键落日志——authorizationStatus 测的是应用自身身份，
-/// 看不见宿主终端（dev 归责）被拒（2026-11-11 TCC 日志实测），排查靠这行。
-pub fn check() -> Option<Blocked> {
+/// 权限门入口：每次开新篇的按键调用。
+/// 观测点：原始状态值逐键落日志（见文件头）；查询失败（None）按已授权放行（fail-open）。
+pub fn check() -> GateAction {
     let raw = mic_status();
-    let blocked = gate_decision(raw.map(mic_status_allowed).unwrap_or(true), crate::inject::accessibility_ok());
-    println!("[perm-gate] 麦克风原始状态 {raw:?}（None=查询失败）、辅助功能 {}，判定 {blocked:?}", 
-        crate::inject::accessibility_ok());
-    blocked
+    let action = gate_decision(raw.unwrap_or(3), crate::inject::accessibility_ok());
+    println!(
+        "[perm-gate] 麦克风原始状态 {raw:?}（None=查询失败按已授权）、辅助功能 {}，判定 {action:?}",
+        crate::inject::accessibility_ok()
+    );
+    action
 }
 
 /// toggle 入口的权限门壳（commands.rs 调用）：仅开新篇相位（Idle/Transcribing）检查，
 /// 其余相位放行——录音中的停止按键永不拦（防用户卡在录音态）。被拦时打 [perm-gate]
-/// 日志，并按 B 案每次运行首次自动带路开对应设置页（system.rs 节流开关）。
+/// 日志；被拦的处理见文件头契约（提示面板 / 授权弹窗先行）。
 /// 返回 true = 已拦下，调用方直接 return。
 pub fn blocked_on_toggle(app: &tauri::AppHandle) -> bool {
-    use std::sync::atomic::Ordering;
     use tauri::Manager;
     let opening_new = app
         .state::<crate::state::SharedState>()
@@ -104,24 +109,108 @@ pub fn blocked_on_toggle(app: &tauri::AppHandle) -> bool {
         return false;
     }
     match check() {
-        Some(blocked) => {
-            println!("[perm-gate] 按键拦截：{blocked:?}");
-            match blocked {
-                Blocked::Mic => {
-                    if !crate::system::AUTO_OPENED_MIC.swap(true, Ordering::Relaxed) {
-                        let _ = crate::system::open_mic_settings(app.clone());
-                    }
-                }
-                Blocked::Accessibility => {
-                    if !crate::system::AUTO_OPENED_ACCESSIBILITY.swap(true, Ordering::Relaxed) {
-                        let _ = crate::system::open_accessibility_page(app);
-                    }
-                }
-            }
+        GateAction::Pass => false,
+        GateAction::RequestMic => {
+            println!("[perm-gate] 首次麦克风授权：系统弹窗先行（无面板）");
+            request_mic_access(app);
             true
         }
-        None => false,
+        GateAction::Prompt(blocked) => {
+            println!("[perm-gate] 按键拦截：{blocked:?}");
+            // 先提示后带路（2026-11-11 用户拍板，改自 B 案的"静默拦+自动带路"）：
+            // 弹面板亮"去开启"按钮，点击才跳系统设置——不再无解释地甩进设置页。
+            // 不进状态机（no_model 同款先例）；反馈型提示无节流，每次被拦都亮
+            use tauri::Emitter;
+            let (error, reason) = match blocked {
+                Blocked::Mic => ("麦克风权限被拒绝——Sayit 收不到声音", "mic_denied"),
+                Blocked::Accessibility => (
+                    "需要辅助功能权限：听写与插入文字都依赖它",
+                    "accessibility",
+                ),
+            };
+            crate::panel::show_panel(app);
+            let _ = app.emit("result", serde_json::json!({ "error": error, "reason": reason }));
+            true
+        }
     }
+}
+
+/// 触发系统麦克风授权弹窗的公共底座（两条路径复用，objc 部分只此一份）：
+/// - 热键路径 request_mic_access：允许 → 接续按键意图自动开录（toggle 全链路）
+/// - 设置页 request_mic_access_quiet：仅广播 mic-perm 事件刷新状态，不自动开录
+/// 在飞标志在此层：系统不重复弹，但 completionHandler 会叠加（两个回调先后触发
+/// toggle 会把刚开的录音立即停掉）
+static MIC_REQUEST_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn trigger_mic_request<F: Fn(bool) + Send + 'static>(on_result: F) {
+    if MIC_REQUEST_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return; // 弹窗已挂着：答复回调会把这次意图一并接上，不重发
+    }
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool, Class};
+    unsafe {
+        let (Some(device_class), Some(nsstring)) =
+            (Class::get("AVCaptureDevice"), Class::get("NSString"))
+        else {
+            MIC_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            eprintln!("[perm-gate] AVCaptureDevice 不可达，跳过授权请求（fail-open）");
+            return;
+        };
+        let Ok(c) = std::ffi::CString::new("soun") else {
+            MIC_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        };
+        let media_type: *mut AnyObject = msg_send![nsstring, stringWithUTF8String: c.as_ptr()];
+        if media_type.is_null() {
+            MIC_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let handler = block2::RcBlock::new(move |granted: Bool| {
+            MIC_REQUEST_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            println!("[perm-gate] 授权弹窗答复：{}", granted.as_bool());
+            on_result(granted.as_bool());
+        });
+        let _: () = msg_send![
+            device_class,
+            requestAccessForMediaType: media_type
+            completionHandler: &*handler
+        ];
+    }
+}
+
+/// 触发系统麦克风授权弹窗（不开麦、面板不上场）。答复在 completionHandler：
+/// 允许 → 接续这次按键的意图直接开录（重走 toggle 全链路，此时已过门）；
+/// 拒绝 → 弹 mic_denied 提示面板（与权限门同款文案）。
+fn request_mic_access(app: &tauri::AppHandle) {
+    let app = app.clone();
+    trigger_mic_request(move |granted| {
+        if granted {
+            // 接续按键意图：重走 toggle 全链路（此时麦克风已授权，门直接放行）
+            crate::commands::toggle_recording_impl(&app);
+        } else {
+            use tauri::Emitter;
+            crate::panel::show_panel(&app);
+            let _ = app.emit(
+                "result",
+                serde_json::json!({
+                    "error": "麦克风权限被拒绝——Sayit 收不到声音",
+                    "reason": "mic_denied"
+                }),
+            );
+        }
+    });
+}
+
+/// 设置页的授权请求（2026-11-11）：答复只广播 mic-perm 事件供设置页刷新状态——
+/// 不自动开录（那是热键路径的语义）
+#[tauri::command]
+pub fn request_mic_permission(app: tauri::AppHandle) {
+    let app = app.clone();
+    trigger_mic_request(move |granted| {
+        use tauri::Emitter;
+        let _ = app.emit("mic-perm", serde_json::json!({ "granted": granted }));
+    });
 }
 
 #[cfg(test)]
@@ -129,20 +218,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn 麦克风状态_未询问与已授权放行_其余拦截() {
-        assert!(mic_status_allowed(0)); // 未询问：放行——首开麦触发系统弹窗，拦了就死锁
-        assert!(mic_status_allowed(3)); // 已授权
-        assert!(!mic_status_allowed(1)); // 受限
-        assert!(!mic_status_allowed(2)); // 拒绝
-        assert!(!mic_status_allowed(9)); // 未知值不冒充放行
-    }
-
-    #[test]
-    fn 权限门_都过才放行_辅助功能优先报() {
-        assert_eq!(gate_decision(true, true), None);
-        assert_eq!(gate_decision(true, false), Some(Blocked::Accessibility));
-        assert_eq!(gate_decision(false, true), Some(Blocked::Mic));
+    fn 权限门_三值判定与优先级() {
+        use GateAction::*;
+        // 已授权 → 放行
+        assert_eq!(gate_decision(3, true), Pass);
+        // 未询问 → 授权弹窗先行（2026-11-11：不再是"放行等首开麦弹窗"）
+        assert_eq!(gate_decision(0, true), RequestMic);
+        // 受限 / 拒绝 / 未知值 → 提示面板，未知值不冒充放行
+        assert_eq!(gate_decision(1, true), Prompt(Blocked::Mic));
+        assert_eq!(gate_decision(2, true), Prompt(Blocked::Mic));
+        assert_eq!(gate_decision(9, true), Prompt(Blocked::Mic));
         // 双缺先报辅助功能（拦得更彻底的那项）
-        assert_eq!(gate_decision(false, false), Some(Blocked::Accessibility));
+        assert_eq!(gate_decision(0, false), Prompt(Blocked::Accessibility));
+        assert_eq!(gate_decision(2, false), Prompt(Blocked::Accessibility));
     }
 }

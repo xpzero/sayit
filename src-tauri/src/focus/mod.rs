@@ -239,6 +239,18 @@ fn wake_ax(pid: i32) -> bool {
     }
 }
 
+/// 开新篇时对前台 App 提前拨 AX 开关（2026-11-11，调用点 commands.rs toggle_core）：
+/// 唤醒时机从交付探测提前一个听写周期——整个听写时长就是建树窗口，交付探测时树
+/// 基本就绪，首轮即判定即注入（Electron 类 App 首录不再亮复制按钮）。幂等：已设过的
+/// App 再设是 no-op；设属性毫秒级，fire-and-forget，失败只记日志。
+pub fn wake_frontmost() {
+    let Some((_, pid)) = crate::inject::frontmost_app() else {
+        return;
+    };
+    println!("[ax-wake] 开新篇：提前拨前台 pid={pid} 的 AX 开关");
+    wake_ax(pid);
+}
+
 /// 三步查询（systemwide → focusedApplication → focusedUIElement → editableAncestor）
 fn ax_query_chain() -> ProbeReport {
     unsafe {

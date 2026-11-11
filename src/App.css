@@ -596,6 +596,10 @@ body:has(.panel-root),
   padding: 22px;
   box-sizing: border-box;
   position: relative;
+  /* 瞬态浮层文字不可划选：面板永不成为键窗（NSPanel 化后无失焦事件），
+     一旦拖选高亮永不清除；取回文字走复制按钮，无划选场景 */
+  user-select: none;
+  -webkit-user-select: none;
 }
 .pill {
   background: var(--paper);

@@ -178,6 +178,14 @@ export default function Panel() {
   // 结果徽标键（纯函数，断言在 panelState.test.ts）：后端 reason → 徽标分支单一事实源
   const badge = state.kind === "result" && !state.error ? badgeKeyOf(state) : null;
 
+  // 立即收板（2026-11-11 用户拍板）：点完复制/去开启等动作按钮、或点到空白处即刻消失，
+  // 不等 5s 自动收起。与 autoHide 定时器同款收尾（藏窗 + 状态复位，下次 show 首帧干净）
+  const dismissPanel = () => {
+    if (hideTimer.current) clearTimeout(hideTimer.current);
+    invoke("hide_panel").catch(() => {});
+    setState((prev) => nextState(prev, { type: "recording", active: false }));
+  };
+
   // 内容区：听写期 = 固定布局（声纹 + 状态灯同屏共存）；结果态是唯一一次内容替换
   // 暖机态（非录音中）：声纹条几乎不可见——"看到暗的=还不能说话"是强视觉信号
   const content = live ? (
@@ -199,17 +207,34 @@ export default function Panel() {
           {state.reason === "no_model" && (
             <button
               className="pill-btn"
-              onClick={() => invoke("open_settings", { tab: "model" }).catch(() => {})}
+              onClick={() => {
+                invoke("open_settings", { tab: "model" }).catch(() => {});
+                dismissPanel();
+              }}
             >
               去模型库下载 →
             </button>
           )}
-          {state.reason === "silent_mic" && (
+          {(state.reason === "silent_mic" || state.reason === "mic_denied") && (
             <button
               className="pill-btn"
-              onClick={() => invoke("open_mic_settings").catch(() => {})}
+              onClick={() => {
+                invoke("open_mic_settings").catch(() => {});
+                dismissPanel();
+              }}
             >
               去系统设置检查麦克风 →
+            </button>
+          )}
+          {state.reason === "accessibility" && (
+            <button
+              className="pill-btn"
+              onClick={() => {
+                invoke("open_accessibility_settings").catch(() => {});
+                dismissPanel();
+              }}
+            >
+              去开启辅助功能 →
             </button>
           )}
         </>
@@ -221,29 +246,45 @@ export default function Panel() {
             {badge === "accessibility" && (
               <button
                 className="pill-btn warn"
-                onClick={() => invoke("open_accessibility_settings").catch(() => {})}
+                onClick={() => {
+                  invoke("open_accessibility_settings").catch(() => {});
+                  dismissPanel();
+                }}
               >
                 未插入 · 去开辅助功能权限
               </button>
             )}
             {badge === "no_input_focus" && (
-              <span className="injected-badge miss">没在输入框 · 点复制取回（历史在设置）</span>
+              <span
+                className="injected-badge miss"
+                title="当前没有可输入的地方（比如点了桌面或文件）。点「复制」，再到想输入的位置粘贴。这段话也保存在 设置 → 历史。"
+              >
+                这里打不了字 · 复制后去粘贴
+              </span>
             )}
             {badge === "unsure_focus" && (
-              <span className="injected-badge miss">不确定光标处 · 点复制取回（历史在设置）</span>
+              <span
+                className="injected-badge miss"
+                title="没能确认光标在哪。点「复制」，再到想输入的位置粘贴更稳妥。这段话也保存在 设置 → 历史。"
+              >
+                没找到输入位置 · 复制后去粘贴
+              </span>
             )}
-            {badge === "miss" && <span className="injected-badge miss">未自动插入 · 点复制取回（历史在设置）</span>}
+            {badge === "miss" && (
+              <span
+                className="injected-badge miss"
+                title="自动插入没有成功。点「复制」，再到想输入的位置粘贴。这段话也保存在 设置 → 历史。"
+              >
+                没插进去 · 复制后去粘贴
+              </span>
+            )}
             <button
               className="pill-btn"
-              onClick={(ev) => {
-                invoke("copy_text", { text: state.text ?? "" })
-                  .then(() => {
-                    ev.currentTarget.textContent = "已复制 ✓";
-                  })
-                  .catch(() => {
-                    // 复制失败必须可见（剪贴板最小侵入契约：点复制才写，写失败不能无声）
-                    ev.currentTarget.textContent = "复制失败 ✗";
-                  });
+              onClick={() => {
+                // 收板与复制并行：NSPasteboard 写入可慢（富内容持有者），面板绝不等它——
+                // 隐藏立即发出，复制后台继续；失败由后端回弹面板亮错（copy_fail）
+                invoke("copy_text", { text: state.text ?? "" }).catch(() => {});
+                dismissPanel();
               }}
             >
               复制
@@ -254,7 +295,14 @@ export default function Panel() {
     ) : null;
 
   return (
-    <div className="panel-root">
+    <div
+      className="panel-root"
+      onClick={(e) => {
+        // 点空白即收（仅结果态）：胶囊内点击不触发（target 不是根），听写中不收（工作 UI）。
+        // 面板**外**的点击由后端 tap 的鼠标分支收（try_click_outside_hide），两端合壁
+        if (state.kind === "result" && e.target === e.currentTarget) dismissPanel();
+      }}
+    >
       {/* idle（窗口已隐藏/将隐藏）不渲染胶囊；听写周期内 .pill 恒定不重挂 */}
       {state.kind !== "idle" && <div className="pill">{content}</div>}
     </div>

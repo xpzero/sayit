@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 麦克风授权弹窗的说明文案（打包版必需：没有此 key 系统静默拒绝、连弹窗都不出；
+	     dev 形态权限归责宿主终端所以此前一直没暴露，2026-11-11 打包前补） -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Sayit 使用麦克风进行本地语音识别，音频只在本机处理，不会上传。</string>
+</dict>
+</plist>

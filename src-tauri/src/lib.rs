@@ -39,6 +39,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_nspanel::init())
         .manage::<state::SharedState>(std::sync::Mutex::new(state::AppState::new()))
         // 设置窗口点 ✕ 只是隐藏（否则窗口被销毁，托盘再点就打不开了）
         .on_window_event(|window, event| {
@@ -71,12 +72,17 @@ pub fn run() {
                 }));
             }
 
+            // App Nap 抑制：常驻听写工具不进 nap（面板收起/热键响应即时性）
+            crate::system::suppress_app_nap();
+
             // 托盘应用形态：不在 Dock 显示图标
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            // 面板窗口启动时摆好位（几何恒定，此后 show/hide 不再碰位置）
+            // 面板窗口摆位（几何恒定，此后 show/hide 不再碰位置）
             panel::position_panel(app.handle());
+            // NSPanel 化：点击面板按钮不激活应用/不抢键盘焦点（tauri-nspanel 插件，见 panel.rs）
+            panel::convert_panel_to_nspanel(app.handle());
 
             // 听写历史（设置页「历史」的数据源）
             history::load_history(app.handle());
@@ -95,8 +101,25 @@ pub fn run() {
                 eprintln!("[hotkey] {e}");
             }
 
-            // 按键事件统一入口（CGEventTap：组合触发/Fn/捕获/Esc 中止）
+            // 按键事件统一入口（CGEventTap：组合触发/Fn/捕获/Esc 中止）+ 撤销看门狗
             hotkey::tap::spawn(app.handle().clone());
+
+            // 辅助功能未授权 → 弹**系统自带**授权请求窗（2026-11-11 用户拍板：唯一引导通道）。
+            // 每次 AX 缺失的启动都请求（系统对重复弹出自带频控；且实测被撤销过的 App 系统
+            // 会自动重现请求窗——双通道并存时系统窗+浮板同时出现打架，浮板通道已删）。
+            // 原 .ax-guided 首启标记随浮板通道一并删除；热键路径的 AX 拦截提示（perm.rs，
+            // tap 存活而 AX 翻 false 的边角）保留不动
+            if !crate::inject::accessibility_ok() {
+                if crate::inject::ax_prompt_showing() {
+                    // 弹窗已在屏（多半是系统对"申请过又撤销"的自动重现）——不重复请求，
+                    // 免得叠窗（2026-11-11 用户拍板）
+                    println!("[ax-guide] 系统授权弹窗已在屏，不再重复请求");
+                } else {
+                    println!("[ax-guide] 辅助功能未授权：弹系统授权请求窗");
+                    let trusted = crate::inject::ax_trusted_with_prompt();
+                    println!("[ax-guide] 系统弹窗已请求，当前 trusted={trusted}");
+                }
+            }
             // Menu 键(110) 状态轮询兜底（实测它不派发 keyDown 事件，tap 看不见）
             hotkey::fn_listener::spawn_monitor(app.handle().clone());
 
@@ -128,6 +151,8 @@ pub fn run() {
             system::open_mic_settings,
             system::accessibility_status,
             system::copy_text,
+            perm::mic_status,
+            perm::request_mic_permission,
             system::open_accessibility_settings,
             system::open_keyboard_settings,
             models::get_model_library,

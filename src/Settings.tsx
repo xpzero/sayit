@@ -39,6 +39,8 @@ export default function Settings() {
   const [capturing, setCapturing] = useState(false); // 快捷键输入框聚焦 = 录制态
   const [preview, setPreview] = useState<string | null>(null); // keydown 实时预览的组合
   const [axOk, setAxOk] = useState<boolean | null>(null);
+  // 麦克风授权原始状态（后端 mic_status：3 已授权/0 未询问/1、2 拒绝·受限；null 查询失败）
+  const [micPerm, setMicPerm] = useState<number | null>(null);
   const cfgRef = useRef<Config | null>(null);
   cfgRef.current = config; // 事件回调里读最新配置用
   const hkInputRef = useRef<HTMLInputElement>(null);
@@ -68,9 +70,13 @@ export default function Settings() {
     invoke<Config>("get_config").then(setConfig);
     invoke<EngineStatus>("detect_engine").then(setEngine);
     invoke<boolean>("accessibility_status").then(setAxOk);
+    invoke<number | null>("mic_status").then(setMicPerm);
     refreshLibrary();
     refreshHistory();
 
+    const unMicPerm = listen<{ granted: boolean }>("mic-perm", (e) => {
+      setMicPerm(e.payload.granted ? 3 : 2);
+    });
     const un1 = listen<{
       stage: string;
       verdict?: string;
@@ -133,6 +139,7 @@ export default function Settings() {
         invoke<Config>("get_config").then(setConfig);
         invoke<EngineStatus>("detect_engine").then(setEngine);
         invoke<boolean>("accessibility_status").then(setAxOk);
+        invoke<number | null>("mic_status").then(setMicPerm);
       } else {
         // 窗口失焦必停捕获：否则焦点去了别的应用还在打字，每个裸键都会被录进配置
         setCapturing(false);
@@ -144,6 +151,7 @@ export default function Settings() {
     const timer = setInterval(refreshLibrary, 2000);
     return () => {
       un1.then((f) => f());
+      unMicPerm.then((f) => f());
       un2.then((f) => f());
       un3.then((f) => f());
       un3b.then((f) => f());
@@ -245,6 +253,7 @@ export default function Settings() {
               selftest={selftest}
               setSelftest={setSelftest}
               axOk={axOk}
+              micPerm={micPerm}
             />
           )}
 

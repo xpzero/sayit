@@ -82,6 +82,10 @@ fn toggle_core(app: &AppHandle) {
             }
         }
     }
+    // AX 提前唤醒（2026-11-11）：Electron/Chromium 的 AX 树默认关闭，唤醒开关原来只在
+    // 交付探测里拨——建树异步，首轮赶不上 300ms 死线（Unknown 亮复制按钮，第二次才注入）。
+    // 开新篇就对前台 App 拨开关（幂等），听写全程就是建树窗口；tap 回调线程绝不阻塞
+    std::thread::spawn(crate::focus::wake_frontmost);
     send_event(app, crate::dictation::Event::TogglePressed, None);
 }
 

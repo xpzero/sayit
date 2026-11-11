@@ -106,12 +106,42 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
 - EDIFIER Fit900NB（USB 声卡）：StartIO 成功后 **~0.5s 才送真信号**，期间回调缺席或送全零；
   偶发驱动级 StartIO 拒绝（错误码 'what'），亚秒内自愈，开麦失败自动重试一次即可覆盖。
 - 麦克风权限被拒：macOS **不报错**，送全零假数据；死麦判定 = 整段峰值 < 0.0001。
-- 触发链：Fn=flagsChanged(12)、Menu(110)=状态轮询兜底、组合键=keyDown(10)。事件编号见 `tap.rs` MASK 注释。
+- 触发链：Fn=flagsChanged(12)、Menu(110)=状态轮询兜底、组合键=keyDown(10)。
+  **tap 创建监护重试（2026-11-11 打包版实测）**：首启时序竞态——授权前启动的进程 tap 创建
+  被 TCC 拒（kTCCServiceListenEvent authValue=0），授权到来后原实现永不重试，热键全死且
+  按键全漏（"没吞键"的真相），用户须手动重启。现创建失败进入 2s 轮询，授权到位自动重建；
+  观测点 /tmp/sayit-tap.log（GUI app stderr 不可见，这次取证全靠系统日志重建的教训）。
+  **撤销自愈看门狗（2026-11-11）**：主动 tap 的存活系于辅助功能——运行中被撤销时系统直接断流
+  （收不到禁用事件，TAP_DISABLED 自愈无从触发），创建轮询又已在成功时退出 → 原状是热键死到重启。
+  现专职线程 2s 巡检 AXIsProcessTrusted，失守即停 runloop → 外环拆旧 tap 回创建重试，授权回来自动复活。
+  **辅助功能引导（同日终案）**：AX 未授权的启动一律弹**系统自带授权请求窗**
+  （AXIsProcessTrustedWithOptions + kAXTrustedCheckOptionPrompt，拒绝/打开系统设置按钮皆系统
+  提供，流程自动把 Sayit 加进辅助功能列表——2026-11-11 用户指出后勘误启用）。实测系统对
+  "申请过又撤销"的 App 会自动重现请求窗——浮板提示通道与之双通道打架（同屏双提示，用户复现），
+  已整体删除（含 .ax-guided 首启标记与前端 accessibility_status 拉取）；系统窗是唯一引导通道。
+  **弹窗去重（同日）**：请求前先查 universalaccessauthalert 进程在不在（libproc 枚举，p_comm
+  截断故前缀匹配 "universalaccess"；inject::ax_prompt_showing）——系统自动重现的弹窗在屏时
+  不再重复调用（免叠窗，用户拍板）。
+  面板提示的收板路径（2026-11-11 用户拍板）：5s 自动收 / 点「去开启」按钮即收 / **点空白即收**——
+  面板内空白走 React 根 onClick（仅 result 态），面板外点击走 tap 的 leftMouseDown 观察分支
+  （MASK 已加 1<<1，仅观察不吞；PANEL_VISIBLE/ACTIVE 无锁镜像 + PANEL_FRAME 启动缓存
+  CG 系逻辑点，收板派回主线程——tap 回调禁锁在案）。**点完复制按钮即收板**（同拍板）。
+  PANEL_FRAME 必须存**计算值**而非 set_position 后回读——macOS 摆位异步生效，回读到搬家前
+  旧坐标，镜像错位后面板内每次点击都被判"点外"而 mousedown 收板、按钮 click 走不完
+  （"复制没反应但浮板消失"的真因，2026-11-11 实测修复）。
+  **App Nap 抑制（同日）**：托盘常驻 + 面板非键窗 → 空闲被 Nap（日志实证 WebContent 周期性
+  nap），面板收起要先唤醒 webview——"面板消失慢"的来源；dev 挂终端下无感。setup 持
+  NSActivityUserInitiatedAllowingIdleSystemSleep（防 Nap、允许系统睡眠，system.rs）。事件编号见 `tap.rs` MASK 注释。
   **吞键政策（2026-11-10）**：tap 为主动模式，已注册组合（听写/粘贴键的精确修饰符+键码，
   含按下与配套抬起）返回 NULL 独占——"绑定即独占"，不再到达前台应用与下游监听者；
   Esc 中止、录制期按键、未注册键一律放行。tap 失效时键漏给应用（安全向降级，有自愈）。
 - 本地识别耗时数秒到数十秒，结果会迟到：`CYCLE` 周期计数器守卫迟到注入，翻篇即丢弃。
-- 面板窗口透明、**尺寸永久固定（520×170）+ 听写期内容结构也固定**：动态贴合内容经三种实现
+- 面板窗口透明、**NSPanel 化（2026-11-11 终案：tauri-nspanel 插件 v2.1 把窗口类 swizzle 成
+  NSPanel 子类 + Nonactivating 掩码——点击面板按钮不再激活应用/不抢键盘焦点；config 钉死
+  can_become_key_window=false 保留 focusable 语义。演进史：focusable:false 只挡成键窗挡不住
+  点击激活（点复制把 Sayit 激活成 frontmost、设置窗被顶起、键盘焦点被抢，WindowServer 实证）；
+  普通 NSWindow 上补 Nonactivating 位实测无效（B 案否决）——非激活语义长在 NSPanel 类上，
+  Typeless 同款方案（Electron type:'panel'）。[panel-style] 观测点）**、**尺寸永久固定（520×170）+ 听写期内容结构也固定**：动态贴合内容经三种实现
   （窗口瞬移/步进动画/透明帧掩护瞬移）实测全部有肉眼抖动——根因是窗口服务 `set_size`/
   `set_position` 异步非原子、WKWebView 陈旧帧拉伸与新视口异步应用，竞态砍不尽；连"固定窗口 +
   内容切换"（无动画纯替换）用户实测仍有抖感（2026-11-09 四轮实测结论）。终局方案：听写期
@@ -145,7 +175,9 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   确认非输入态（AX 判定 NoInput）→ 跳过注入亮复制按钮。判不出（Unknown，终端判定也未
   救回）→ 同样跳过注入，亮"不确定光标处"复制按钮（2026-11-11 增补，重启当年"Unknown
   走按钮"否决案——依据已变：终端有 TTY 兜底、Electron 靠 AX 唤醒只盲首轮，ZCode 等
-  只首撞一次按钮）；落空兜底在听写历史里逐条取回。**Electron/Chromium 的 AX 唤醒**：
+  只首撞一次按钮）；落空兜底在听写历史里逐条取回。**Electron/Chromium 的 AX 唤醒**：**开新篇即提前拨开关**（2026-11-11，wake_frontmost，
+[ax-wake] 观测点）——原时机在交付探测里、建树赶不上首轮死线，Electron 首录必亮按钮、
+第二次才注入；提前一个听写周期后首轮即判定即注入（残余边角：极短听写+冷树仍亮按钮自愈）。
   探测全灭时设 AXManualAccessibility（Electron 认）
   与 AXEnhancedUserInterface（Chrome 认）为 true——官方记载的第三方机制，树异步建起后这些 App
   即可逐状态判定；建树期（首轮）由乐观注入覆盖。曾否决过"Unknown 不注入走按钮"与"按应用规则"，
@@ -155,13 +187,19 @@ stdout 只在 dev 终端可见，但能与 `log show` 的系统侧行为交叉�
   注入成功即收起面板（零打扰：复制按钮只出现在"没注入进去"的现场）。
   取证仪器：/tmp/sayit-focus.log（每次听写一行判定/AX 错误码/前台 App）。
   AX 通道在 dev 的可用性依赖固定签名身份（见上「AX 探测死亡陷阱」勘误与 dev-runner.sh）。
-- **权限门（2026-11-10 B 案）**：开新篇的按键实时查两项（TCC 缓存读，微秒级，授权后无需
-  重启）——麦克风明确拒绝/受限（AVCaptureDevice authorizationStatus，"未询问"必须放行：系统
-  弹窗只在首次开麦出现，拦了就死锁）或辅助功能未开（AXIsProcessTrusted）→ 按键失效：不进
-  状态机、面板不出现；每次运行首次被拦自动带路开对应设置页（system.rs 节流开关）。
+- **权限门（2026-11-10 B 案；2026-11-11 两改：带路改提示式、未询问改弹窗先行）**：开新篇的按键实时查
+  两项（TCC 缓存读，微秒级，授权后无需重启）。三值判定 GateAction（断言在 perm.rs tests）：麦克风
+  "未询问" → **requestAccess 弹窗先行**（面板不上场，消除死麦早停与弹窗竞态；允许 → 接续按键意图
+  自动开录，拒绝 → mic_denied 提示面板；在飞标志防回调叠加把刚开的录音又停掉）。授权底座
+  trigger_mic_request 两路复用：热键路径自动开录；**设置页 request_mic_permission（2026-11-11）
+  仅广播 mic-perm 事件刷新状态、不自动开录**——设置页权限体检格的麦克风格已升级三态授权中枢
+  （3 自检 / 0 弹授权窗 / 1、2 带路系统设置；mic_status 成为命令）。
+  麦克风明确拒绝/受限（authorizationStatus）或辅助功能未开（AXIsProcessTrusted）→ 按键失效：不进
+  状态机；**先弹面板提示**（错误文案 + 「去开启 →」按钮，点击才跳系统设置——不再无解释地
+  甩进设置页；反馈型提示无节流。NeedPermission 落空同款：面板回弹亮文字与按钮，文字在剪贴板+历史）。
   录音中/开麦中的按键永不拦（防卡录音态）；查询失败按放行（fail-open），误放行由死麦判定/
   注入 NeedPermission 兜底。观测点：[perm-gate]。门体在 perm.rs（纯核心 gate_decision
-  /mic_status_allowed 断言在 tests）。
+  三值 GateAction 断言在 tests）。
 - **开麦流程**：先见面板（加载态）→ 后台开麦（失败自动重试一次）→ 声纹亮起 = **时间基准**
   （开流后 700ms；三拍实测 2026-11-10：设备预热 435–570ms，见 /tmp/sayit-mic.log 三拍日志），
   真信号（说话越线）仍会提前触发，谁先到谁宣布。原"等真信号 + 2s 兜底"实测造成等待死锁：

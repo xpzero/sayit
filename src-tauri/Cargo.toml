@@ -1,6 +1,6 @@
 [package]
 name = "sayit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Sayit — 本地优先的 macOS 语音输入工具"
 authors = ["xpzero"]
 license = "MIT"
@@ -28,6 +28,8 @@ hound = "3"
 arboard = "3"
 enigo = "0.2"
 objc2 = "0.5" # NSWorkspace 前台应用查询（桌面回退判定；版本随 enigo 依赖树，零新增编译）
+block2 = "0.5" # ObjC block（AVCaptureDevice 授权回调）；objc2 同作者同版本档，纯 Rust 无 Swift 桥
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" } # 面板窗口 NSPanel 化（点击不激活应用）；tauri 2 专用分支，Cap/Overlayed 同款生产用法
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

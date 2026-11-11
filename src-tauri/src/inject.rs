@@ -16,6 +16,101 @@ pub enum InjectOutcome {
     Failed(String),
 }
 
+// 带系统提示窗的信任查询（2026-11-11 勘误启用）：kAXTrustedCheckOptionPrompt=true 时，
+// 未授权则弹**系统级**授权请求窗（「Sayit」想控制此电脑 + 拒绝/打开系统设置，
+// 系统流程会把 App 加进辅助功能列表——比自制对话框更原生，带路按钮也是系统的）。
+// 返回当前信任状态；弹窗异步展示不阻塞。勘误背景：AGENTS 曾记“辅助功能系统不弹窗”，
+// 实为手动引导是兑底、系统提示窗一直存在（用户指出，axuielement 文档在案）
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct CFDictCallBacks {
+    _priv: [usize; 6], // CFDictionaryKeyCallBacks/ValueCallBacks 的不透明布局（6 个指针）
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrustedWithOptions(options: *const core::ffi::c_void) -> bool;
+    static kAXTrustedCheckOptionPrompt: *const core::ffi::c_void;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFDictionaryCreate(
+        allocator: *const core::ffi::c_void,
+        keys: *const *const core::ffi::c_void,
+        values: *const *const core::ffi::c_void,
+        num_values: isize,
+        key_callbacks: *const CFDictCallBacks,
+        value_callbacks: *const CFDictCallBacks,
+    ) -> *const core::ffi::c_void;
+    static kCFBooleanTrue: *const core::ffi::c_void;
+    static kCFTypeDictionaryKeyCallBacks: CFDictCallBacks;
+    static kCFTypeDictionaryValueCallBacks: CFDictCallBacks;
+}
+
+#[cfg(target_os = "macos")]
+pub fn ax_trusted_with_prompt() -> bool {
+    unsafe {
+        let keys = [kAXTrustedCheckOptionPrompt as *const core::ffi::c_void];
+        let values = [kCFBooleanTrue as *const core::ffi::c_void];
+        let options = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        AXIsProcessTrustedWithOptions(options)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ax_trusted_with_prompt() -> bool {
+    true
+}
+
+/// 系统辅助功能授权弹窗是否在屏：弹窗由独立小进程 universalaccessauthalert 渲染
+/// （AXIsProcessTrustedWithOptions 的 prompt，或系统对"申请过又撤销"App 的自动重现）。
+/// 它在跑 = 弹窗在屏（或刚被关、进程短暂存活）。libproc 枚举进程名前缀匹配——
+/// p_comm 截断到 16 字节，"universalaccessauthalert" 只剩 "universalaccessa"
+#[cfg(target_os = "macos")]
+pub fn ax_prompt_showing() -> bool {
+    // proc_listallpids/proc_name 在 libSystem（无独立 libproc tbd，#[link] 反而链接失败）
+    unsafe extern "C" {
+        fn proc_listallpids(buffer: *mut i32, size: i32) -> i32;
+        fn proc_name(pid: i32, buffer: *mut core::ffi::c_void, buffer_size: u32) -> i32;
+    }
+    unsafe {
+        let mut pids = [0i32; 512];
+        let n = proc_listallpids(pids.as_mut_ptr(), (pids.len() * 4) as i32);
+        if n <= 0 {
+            return false;
+        }
+        for &pid in &pids[..(n as usize).min(pids.len())] {
+            if pid <= 0 {
+                continue;
+            }
+            let mut buf = [0u8; 256];
+            if proc_name(pid, buf.as_mut_ptr().cast(), 256) > 0 {
+                if let Ok(name) = std::ffi::CStr::from_bytes_until_nul(&buf) {
+                    if name.to_bytes().starts_with(b"universalaccess") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn ax_prompt_showing() -> bool {
+    false
+}
+
 // macOS 辅助功能授权查询（ApplicationServices 框架）
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]

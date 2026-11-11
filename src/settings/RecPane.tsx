@@ -14,8 +14,9 @@ export function RecPane(p: {
   selftest: Selftest;
   setSelftest: (s: Selftest) => void;
   axOk: boolean | null;
+  micPerm: number | null; // 3 已授权 / 0 未询问 / 1、2 拒绝·受限 / null 查询失败
 }) {
-  const { config, engine, defaultModel, setTab, selftest, setSelftest, axOk,
+  const { config, engine, defaultModel, setTab, selftest, setSelftest, axOk, micPerm,
           setProvider, setCloud } = p;
   return (
     <>
@@ -25,42 +26,63 @@ export function RecPane(p: {
             <button
               className={
                 "perm-cell" +
-                (selftest.kind === "done"
-                  ? selftest.level === "ok"
-                    ? " ok"
-                    : selftest.level === "quiet"
-                      ? " warn"
-                      : " bad"
-                  : selftest.kind === "error"
-                    ? " bad"
-                    : "")
+                (micPerm === null
+                  ? ""
+                  : micPerm === 3
+                    ? selftest.kind === "done"
+                      ? selftest.level === "ok"
+                        ? " ok"
+                        : selftest.level === "quiet"
+                          ? " warn"
+                          : " bad"
+                      : selftest.kind === "error"
+                        ? " bad"
+                        : ""
+                    : " bad") // 未授权/被拒绝：权限是自检的前置，先亮红
               }
               title={
-                selftest.kind === "done"
-                  ? selftest.verdict
-                  : "录 1.5 秒自检——测试期间要对着麦克风说话；全零=权限被拒"
+                micPerm === 0
+                  ? "首次使用需要授权：点击弹出系统授权窗"
+                  : micPerm === 1 || micPerm === 2
+                    ? "系统设置里拒绝了 Sayit 的麦克风——点击前往开启"
+                    : selftest.kind === "done"
+                      ? selftest.verdict
+                      : "录 1.5 秒自检——测试期间要对着麦克风说话；全零=权限被拒"
               }
               onClick={() => {
-                setSelftest({ kind: "recording" });
-                invoke("mic_selftest").catch(() => {});
+                // 三态分流：未询问→系统授权窗；被拒绝→带路系统设置；已授权→自检
+                if (micPerm === 0) {
+                  invoke("request_mic_permission").catch(() => {});
+                } else if (micPerm === 1 || micPerm === 2) {
+                  invoke("open_mic_settings").catch(() => {});
+                } else {
+                  setSelftest({ kind: "recording" });
+                  invoke("mic_selftest").catch(() => {});
+                }
               }}
             >
               {Ico.mic}
               <b>麦克风</b>
               <small>
-                {selftest.kind === "recording"
-                  ? "请说句话…"
-                  : selftest.kind === "done"
-                    ? selftest.level === "ok"
-                      ? "正常 ✓"
-                      : selftest.level === "quiet"
-                        ? "声音轻 · 凑近说"
-                        : selftest.level === "silent"
-                          ? "全零 · 查权限"
-                          : "无数据"
-                    : selftest.kind === "error"
-                      ? "失败 ✗"
-                      : "点击测试"}
+                {micPerm === null
+                  ? "查询中…"
+                  : micPerm === 0
+                    ? "未授权 · 点击开启"
+                    : micPerm === 1 || micPerm === 2
+                      ? "被拒绝 · 点击去开启"
+                      : selftest.kind === "recording"
+                        ? "请说句话…"
+                        : selftest.kind === "done"
+                          ? selftest.level === "ok"
+                            ? "正常 ✓"
+                            : selftest.level === "quiet"
+                              ? "声音轻 · 凑近说"
+                              : selftest.level === "silent"
+                                ? "全零 · 查权限"
+                                : "无数据"
+                          : selftest.kind === "error"
+                            ? "失败 ✗"
+                            : "点击测试"}
               </small>
             </button>
             <button

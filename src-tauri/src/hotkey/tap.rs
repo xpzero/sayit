@@ -49,6 +49,15 @@ unsafe extern "C" {
     fn CGEventGetIntegerValueField(event: *const core::ffi::c_void, field: isize) -> i64;
     fn CGEventGetFlags(event: *const core::ffi::c_void) -> u64;
     fn CGEventTapEnable(tap: *const core::ffi::c_void, enable: bool);
+    fn CGEventGetLocation(event: *const core::ffi::c_void) -> CGPoint;
+    fn CFRunLoopStop(rl: *const core::ffi::c_void);
+    fn CFRunLoopRemoveSource(
+        rl: *const core::ffi::c_void,
+        source: *const core::ffi::c_void,
+        mode: *const core::ffi::c_void,
+    );
+    fn CFMachPortInvalidate(port: *const core::ffi::c_void);
+    fn CFRelease(cf: *const core::ffi::c_void);
 }
 
 const SESSION_TAP: i32 = 1; // kCGSessionEventTap
@@ -58,13 +67,20 @@ const ACTIVE_TAP: isize = 0; // kCGEventTapOptionDefault：主动 tap——回�
 // 曾误写成 1/2/12——1/2 其实是左键按下/抬起（鼠标事件！）：tap 只看得见鼠标点击和 Fn，
 // 字母/数字/空格组合键与 Esc 中止全部失灵；鼠标点击还顶着"键码 0"的马甲混进
 // keyDown 通道（即 handle_key_down 里那只"幽灵键码 0"的真身）
-const MASK: u64 = (1 << 10) | (1 << 11) | (1 << 12); // keyDown | keyUp | flagsChanged
+const MASK: u64 = (1 << 10) | (1 << 11) | (1 << 12) | (1 << 1); // keyDown | keyUp | flagsChanged | leftMouseDown（仅观察：面板提示的点外收板用，不吞）
 const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFE1; // kCGEventTapDisabledByTimeout
 const TAP_DISABLED_BY_USER: u32 = 0xFFFF_FFE0; // kCGEventTapDisabledByUserInput
 
 const T_KEYDOWN: u32 = 10;
 const T_KEYUP: u32 = 11;
 const T_FLAGS_CHANGED: u32 = 12;
+const T_LEFT_MOUSE_DOWN: u32 = 1;
+
+#[repr(C)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
 
 const F_KEYCODE: isize = 9; // kCGKeyboardEventKeycode
 const F_AUTOREPEAT: isize = 8; // kCGKeyboardEventAutorepeat
@@ -90,6 +106,8 @@ static PENDING: AtomicU16 = AtomicU16::new(0);
 static PENDING_COMBO: Mutex<Option<String>> = Mutex::new(None);
 static MAIN_SEEN: AtomicBool = AtomicBool::new(false);
 static TAP_PORT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// 当前 tap 线程的 runloop（撤销看门狗停它用；0 = tap 未运行）
+static TAP_RUNLOOP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn set_dictation(combos: Vec<(u64, u16)>, fn_on: bool) {
     if let Ok(mut set) = DICTATION.lock() {
@@ -174,6 +192,12 @@ extern "C" fn on_event(
     }
 
     match etype {
+        T_LEFT_MOUSE_DOWN => {
+            // 仅观察不吞：点击照常到达用户的应用。点在面板外且面板可见且空闲 → 收板
+            // （提示胶囊的"点空白即收"；坐标与 PANEL_FRAME 同为 CG 系逻辑点）
+            let p = unsafe { CGEventGetLocation(event) };
+            crate::panel::try_click_outside_hide(app, p.x, p.y);
+        }
         T_FLAGS_CHANGED => handle_flags_changed(app, keycode, flags),
         T_KEYDOWN => {
             if unsafe { CGEventGetIntegerValueField(event, F_AUTOREPEAT) } != 0 {
@@ -307,38 +331,89 @@ fn registered_combo(combo: (u64, u16)) -> bool {
 struct SendPtr(*const AppHandle);
 unsafe impl Send for SendPtr {}
 
+// tap 侧观测日志（GUI app 的 stderr 不可见——2026-11-11 打包版取证全靠系统日志重建，
+// 补文件观测点。超 1MB 轮转，与 sayit-focus.log 同款）
+fn tap_log(line: &str) {
+    use std::io::Write;
+    const LOG: &str = "/tmp/sayit-tap.log";
+    if std::fs::metadata(LOG).map(|m| m.len() > 1_000_000).unwrap_or(false) {
+        let _ = std::fs::remove_file(LOG);
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(LOG) {
+        let _ = writeln!(f, "[{ts}] {line}");
+    }
+    println!("[tap] {line}");
+}
+
 fn run_tap(carrier: SendPtr) {
     unsafe {
         let SendPtr(info) = carrier;
-        let tap = CGEventTapCreate(
-            SESSION_TAP,
-            HEAD_INSERT,
-            ACTIVE_TAP,
-            MASK,
-            on_event,
-            info as *const core::ffi::c_void,
-        );
-        if tap.is_null() {
-            eprintln!("[tap] 创建失败：无辅助功能权限？（触发与捕获将不可用）");
-            return;
+        // 生命周期外环（创建监护重试 + 撤销自愈，2026-11-11）：
+        // - 创建重试：首启时序竞态——授权前启动的进程 tap 创建被 TCC 拒绝
+        //   （kTCCServiceListenEvent authValue=0），低频轮询（2s）直到授权到位自动重建
+        //   （原实现永不重试，用户须手动重启）。
+        // - 撤销自愈：主动 tap 的存活系于辅助功能授权——运行中被撤销时系统直接断流
+        //   （收不到禁用事件，既有 TAP_DISABLED 自愈无从触发）。看门狗发现授权翻 false
+        //   即停 runloop，外环接手：拆旧 tap 回到创建重试，授权回来自动复活。
+        // 观测点逐段落 /tmp/sayit-tap.log
+        loop {
+            let tap = loop {
+                let t = CGEventTapCreate(
+                    SESSION_TAP,
+                    HEAD_INSERT,
+                    ACTIVE_TAP,
+                    MASK,
+                    on_event,
+                    info as *const core::ffi::c_void,
+                );
+                if !t.is_null() {
+                    break t;
+                }
+                tap_log("创建失败（多半辅助功能未授权），2s 后重试");
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+            };
+            TAP_PORT.store(tap as usize, Ordering::Relaxed); // 超时自愈要用
+            tap_log("事件监听已启动");
+            let rl = CFRunLoopGetCurrent();
+            let src = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
+            if src.is_null() {
+                eprintln!("[tap] runloop source 创建失败");
+                return;
+            }
+            CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
+            TAP_RUNLOOP.store(rl as usize, Ordering::Relaxed);
+            CFRunLoopRun();
+            // 走到这 = 看门狗停了我们（授权没了）：拆旧 tap，回外环重试
+            TAP_RUNLOOP.store(0, Ordering::Relaxed);
+            TAP_PORT.store(0, Ordering::Relaxed);
+            CFRunLoopRemoveSource(rl, src, kCFRunLoopCommonModes);
+            CFMachPortInvalidate(tap);
+            CFRelease(src);
+            CFRelease(tap);
+            tap_log("授权丢失，tap 已拆除——等待重新授权重建");
         }
-        TAP_PORT.store(tap as usize, Ordering::Relaxed); // 超时自愈要用
-        println!("[tap] 事件监听已启动");
-        let rl = CFRunLoopGetCurrent();
-        let src = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
-        if src.is_null() {
-            eprintln!("[tap] runloop source 创建失败");
-            return;
-        }
-        CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
-        CFRunLoopRun();
     }
 }
 
-// 启动 tap 线程（专职跑 CFRunLoop）。Box::into_raw 是有意的泄露：AppHandle 与进程同寿。
+// 启动 tap 线程（专职跑 CFRunLoop）+ 撤销看门狗。Box::into_raw 是有意的泄露：AppHandle 与进程同寿。
 pub fn spawn(app: AppHandle) {
     let carrier = SendPtr(Box::into_raw(Box::new(app)));
     std::thread::spawn(move || run_tap(carrier));
+    std::thread::spawn(|| loop {
+        // 2s 与创建重试同拍；AXIsProcessTrusted 是 TCC 缓存读（微秒级）无副作用。
+        // 主动 tap 的创建与存活都系于辅助功能，翻 false = tap 已死/将死——停 runloop
+        // 交给外环重建，授权回来自动复活（撤销→重开辅助功能不再需要重启 app）
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        let rl = TAP_RUNLOOP.load(Ordering::Relaxed) as *const core::ffi::c_void;
+        if !rl.is_null() && !crate::inject::accessibility_ok() {
+            tap_log("看门狗：辅助功能已撤销，停 tap 待重建");
+            unsafe { CFRunLoopStop(rl) };
+        }
+    });
 }
 
 #[cfg(test)]
